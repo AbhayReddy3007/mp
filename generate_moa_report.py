@@ -2,14 +2,14 @@
 generate_moa_report.py
 ──────────────────────
 Reads scored data from BigQuery `moa_innovation_table` and generates a
-professional Word (.docx) report using Gemini for narrative generation.
+professional PDF report using Gemini for narrative generation.
 
 Only the LATEST row per drug (by created_at) is used.
 
 Usage:
     python market_potential/generate_moa_report.py
     python market_potential/generate_moa_report.py --molecule Semaglutide
-    python market_potential/generate_moa_report.py --output moa_report.docx
+    python market_potential/generate_moa_report.py --output moa_report.pdf
 """
 
 import os
@@ -28,11 +28,17 @@ except ImportError:
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from docx import Document
-from docx.shared import Inches, Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn
+
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    HRFlowable, PageBreak, KeepTogether
+)
+from reportlab.platypus.flowables import HRFlowable
 
 from google import genai as genai_client
 from google.genai import types
@@ -49,16 +55,23 @@ BQ_TABLE = "moa_innovation_table"
 
 GCS_BUCKET = "cognito-gcs"
 GCS_BASE_PATH = "Cognito_new/reports"
-GCS_FILE_NAME = "MoA_Innovation_Analysis.docx"
+GCS_FILE_NAME = "MoA_Innovation_Analysis.pdf"
 
 REPORT_TITLE = "MoA Innovation Scoring Analysis"
 
-SCORE_COLOR_MAP = {
-    5: RGBColor(0x00, 0x80, 0x00),  # Green  – Exceptional
-    4: RGBColor(0x4C, 0xAF, 0x50),  # Light green – Strong
-    3: RGBColor(0xCC, 0x99, 0x00),  # Amber – Moderate
-    2: RGBColor(0xE6, 0x51, 0x00),  # Orange-red – Weak
-    1: RGBColor(0xCC, 0x00, 0x00),  # Red – Poor
+# ── Colors ────────────────────────────────────────────────────────────────────
+DARK_BLUE = colors.HexColor("#1F3864")
+LIGHT_BLUE_BG = colors.HexColor("#E8EDF3")
+WHITE = colors.white
+LIGHT_GRAY = colors.HexColor("#666666")
+VERY_LIGHT_GRAY = colors.HexColor("#999999")
+
+SCORE_COLORS = {
+    5: colors.HexColor("#008000"),  # Green  – Exceptional
+    4: colors.HexColor("#4CAF50"),  # Light green – Strong
+    3: colors.HexColor("#CC9900"),  # Amber – Moderate
+    2: colors.HexColor("#E65100"),  # Orange-red – Weak
+    1: colors.HexColor("#CC0000"),  # Red – Poor
 }
 
 SCORE_LABEL = {
@@ -70,12 +83,15 @@ SCORE_LABEL = {
 }
 
 CLASSIFICATION_COLORS = {
-    "First-in-Class": RGBColor(0x00, 0x80, 0x00),
-    "Best-in-Class": RGBColor(0x4C, 0xAF, 0x50),
-    "Me-too": RGBColor(0xCC, 0x99, 0x00),
-    "Weak/Outdated": RGBColor(0xE6, 0x51, 0x00),
-    "Poor/Invalid": RGBColor(0xCC, 0x00, 0x00),
+    "first-in-class": colors.HexColor("#008000"),
+    "best-in-class": colors.HexColor("#4CAF50"),
+    "me-too": colors.HexColor("#CC9900"),
+    "weak/outdated": colors.HexColor("#E65100"),
+    "poor/invalid": colors.HexColor("#CC0000"),
 }
+
+GUARDRAIL_PASS_COLOR = colors.HexColor("#008000")
+GUARDRAIL_FAIL_COLOR = colors.HexColor("#CC0000")
 
 
 # ── Gemini helper ─────────────────────────────────────────────────────────────
@@ -240,22 +256,144 @@ Respond ONLY with a valid JSON object (no markdown fences):
     }
 
 
-# ── Document builder helpers ──────────────────────────────────────────────────
+# ── Style helpers ─────────────────────────────────────────────────────────────
 
-def set_cell_shading(cell, hex_color: str):
-    shading = cell._element.get_or_add_tcPr()
-    shading_el = shading.makeelement(qn("w:shd"), {
-        qn("w:fill"): hex_color, qn("w:val"): "clear",
-    })
-    shading.append(shading_el)
+def build_styles():
+    base = getSampleStyleSheet()
+
+    styles = {
+        "title": ParagraphStyle(
+            "ReportTitle",
+            parent=base["Normal"],
+            fontSize=20,
+            leading=24,
+            textColor=DARK_BLUE,
+            alignment=TA_CENTER,
+            fontName="Helvetica-Bold",
+            spaceAfter=4,
+        ),
+        "subtitle": ParagraphStyle(
+            "ReportSubtitle",
+            parent=base["Normal"],
+            fontSize=9,
+            leading=12,
+            textColor=LIGHT_GRAY,
+            alignment=TA_CENTER,
+            fontName="Helvetica",
+            spaceAfter=12,
+        ),
+        "h2": ParagraphStyle(
+            "H2",
+            parent=base["Normal"],
+            fontSize=13,
+            leading=16,
+            textColor=DARK_BLUE,
+            fontName="Helvetica-Bold",
+            spaceBefore=14,
+            spaceAfter=6,
+        ),
+        "h3": ParagraphStyle(
+            "H3",
+            parent=base["Normal"],
+            fontSize=11,
+            leading=14,
+            textColor=DARK_BLUE,
+            fontName="Helvetica-Bold",
+            spaceBefore=10,
+            spaceAfter=4,
+        ),
+        "body": ParagraphStyle(
+            "Body",
+            parent=base["Normal"],
+            fontSize=10,
+            leading=14,
+            textColor=colors.HexColor("#333333"),
+            fontName="Helvetica",
+            spaceAfter=4,
+            alignment=TA_JUSTIFY,
+        ),
+        "bullet": ParagraphStyle(
+            "Bullet",
+            parent=base["Normal"],
+            fontSize=10,
+            leading=14,
+            textColor=colors.HexColor("#333333"),
+            fontName="Helvetica",
+            spaceAfter=3,
+            leftIndent=16,
+            bulletIndent=4,
+        ),
+        "stat": ParagraphStyle(
+            "Stat",
+            parent=base["Normal"],
+            fontSize=9,
+            leading=12,
+            textColor=LIGHT_GRAY,
+            fontName="Helvetica-Oblique",
+            spaceAfter=4,
+        ),
+        "footer": ParagraphStyle(
+            "Footer",
+            parent=base["Normal"],
+            fontSize=7,
+            leading=10,
+            textColor=colors.HexColor("#999999"),
+            fontName="Helvetica-Oblique",
+            alignment=TA_CENTER,
+            spaceBefore=10,
+        ),
+        "cell": ParagraphStyle(
+            "Cell",
+            parent=base["Normal"],
+            fontSize=8,
+            leading=11,
+            textColor=colors.HexColor("#333333"),
+            fontName="Helvetica",
+            alignment=TA_CENTER,
+        ),
+        "cell_header": ParagraphStyle(
+            "CellHeader",
+            parent=base["Normal"],
+            fontSize=8,
+            leading=11,
+            textColor=WHITE,
+            fontName="Helvetica-Bold",
+            alignment=TA_CENTER,
+        ),
+        "cell_label": ParagraphStyle(
+            "CellLabel",
+            parent=base["Normal"],
+            fontSize=9,
+            leading=12,
+            textColor=colors.HexColor("#333333"),
+            fontName="Helvetica-Bold",
+        ),
+        "cell_value": ParagraphStyle(
+            "CellValue",
+            parent=base["Normal"],
+            fontSize=9,
+            leading=12,
+            textColor=colors.HexColor("#333333"),
+            fontName="Helvetica",
+        ),
+    }
+    return styles
 
 
-def _styled_heading(doc, text, level=2, color=RGBColor(0x1F, 0x38, 0x64), size=Pt(13)):
-    h = doc.add_heading(text, level=level)
-    for run in h.runs:
-        run.font.color.rgb = color
-        run.font.size = size
-    return h
+def _score_color(score_val):
+    try:
+        s = int(float(score_val))
+        return SCORE_COLORS.get(s, colors.black)
+    except (ValueError, TypeError):
+        return colors.black
+
+
+def _classification_color(cls_str):
+    cls_lower = str(cls_str).lower()
+    for key, color in CLASSIFICATION_COLORS.items():
+        if key in cls_lower:
+            return color
+    return colors.black
 
 
 # ── Report builder ────────────────────────────────────────────────────────────
@@ -270,230 +408,214 @@ def build_report(df: pd.DataFrame, output_path: str):
     print("Generating narrative with Gemini...")
     narrative = generate_executive_summary(stats, df)
 
-    doc = Document()
+    styles = build_styles()
+    story = []
 
-    # ── Page setup ────────────────────────────────────────────────────────────
-    section = doc.sections[0]
-    section.page_width = Inches(8.5)
-    section.page_height = Inches(11)
-    section.top_margin = Inches(0.8)
-    section.bottom_margin = Inches(0.6)
-    section.left_margin = Inches(0.9)
-    section.right_margin = Inches(0.9)
-
-    # ── Default font ──────────────────────────────────────────────────────────
-    style = doc.styles["Normal"]
-    font = style.font
-    font.name = "Arial"
-    font.size = Pt(10)
-    font.color.rgb = RGBColor(0x33, 0x33, 0x33)
-    style.paragraph_format.space_after = Pt(4)
-    style.paragraph_format.space_before = Pt(0)
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=letter,
+        topMargin=0.8 * inch,
+        bottomMargin=0.6 * inch,
+        leftMargin=0.9 * inch,
+        rightMargin=0.9 * inch,
+        title=REPORT_TITLE,
+        author="MoA Innovation Scorer",
+    )
 
     # ── Title ─────────────────────────────────────────────────────────────────
-    title = doc.add_paragraph()
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run(REPORT_TITLE)
-    run.bold = True
-    run.font.size = Pt(18)
-    run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-
-    sub = doc.add_paragraph()
-    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = sub.add_run(
+    story.append(Paragraph(REPORT_TITLE, styles["title"]))
+    story.append(Paragraph(
         f"Generated {datetime.now().strftime('%B %d, %Y')}  •  "
-        f"{stats['total_drugs']} Drug(s) Assessed"
-    )
-    run.font.size = Pt(9)
-    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-    sub.paragraph_format.space_after = Pt(10)
-
-    # Divider
-    p_line = doc.add_paragraph()
-    p_line.paragraph_format.space_after = Pt(6)
-    pBdr = p_line._element.get_or_add_pPr().makeelement(qn("w:pBdr"), {})
-    bottom = pBdr.makeelement(qn("w:bottom"), {
-        qn("w:val"): "single", qn("w:sz"): "6",
-        qn("w:space"): "1", qn("w:color"): "1F3864",
-    })
-    pBdr.append(bottom)
-    p_line._element.get_or_add_pPr().append(pBdr)
+        f"{stats['total_drugs']} Drug(s) Assessed",
+        styles["subtitle"],
+    ))
+    story.append(HRFlowable(width="100%", thickness=2, color=DARK_BLUE, spaceAfter=12))
 
     # ── Executive Summary ─────────────────────────────────────────────────────
-    _styled_heading(doc, "Executive Summary")
-    p = doc.add_paragraph(narrative.get("executive_summary", ""))
-    p.paragraph_format.space_after = Pt(6)
+    story.append(Paragraph("Executive Summary", styles["h2"]))
+    story.append(Paragraph(narrative.get("executive_summary", ""), styles["body"]))
+    story.append(Spacer(1, 6))
 
     # ── Portfolio Overview ────────────────────────────────────────────────────
-    _styled_heading(doc, "Portfolio Overview")
+    story.append(Paragraph("Portfolio Overview", styles["h2"]))
 
-    overview_items = [
-        ("Total Drugs Assessed", str(stats["total_drugs"])),
-        ("Drugs Covered", ", ".join(stats["drugs"])),
-        ("Average MoA Score", f"{stats['avg_score']} / 5" if stats["avg_score"] else "N/A"),
-        ("Guardrail Summary", f"{stats['guardrail_pass']} PASS  |  {stats['guardrail_fail']} FAIL"),
+    dist_parts = [
+        f"{SCORE_LABEL[s]}: {stats['score_distribution'].get(s, 0)}"
+        for s in [5, 4, 3, 2, 1]
+        if stats["score_distribution"].get(s, 0) > 0
+    ]
+    cls_parts = [
+        f"{cls}: {cnt}"
+        for cls, cnt in stats["classification_distribution"].items()
     ]
 
-    dist_parts = []
-    for s in [5, 4, 3, 2, 1]:
-        count = stats["score_distribution"].get(s, 0)
-        if count > 0:
-            dist_parts.append(f"{SCORE_LABEL[s]}: {count}")
+    overview_data = [
+        [Paragraph("Total Drugs Assessed", styles["cell_label"]),
+         Paragraph(str(stats["total_drugs"]), styles["cell_value"])],
+        [Paragraph("Drugs Covered", styles["cell_label"]),
+         Paragraph(", ".join(stats["drugs"]), styles["cell_value"])],
+        [Paragraph("Average MoA Score", styles["cell_label"]),
+         Paragraph(f"{stats['avg_score']} / 5" if stats["avg_score"] else "N/A", styles["cell_value"])],
+        [Paragraph("Guardrail Summary", styles["cell_label"]),
+         Paragraph(f"{stats['guardrail_pass']} PASS  |  {stats['guardrail_fail']} FAIL", styles["cell_value"])],
+    ]
     if dist_parts:
-        overview_items.append(("Score Distribution", "; ".join(dist_parts)))
-
-    cls_parts = []
-    for cls_name, cnt in stats["classification_distribution"].items():
-        cls_parts.append(f"{cls_name}: {cnt}")
+        overview_data.append([
+            Paragraph("Score Distribution", styles["cell_label"]),
+            Paragraph(";  ".join(dist_parts), styles["cell_value"]),
+        ])
     if cls_parts:
-        overview_items.append(("Classification Distribution", "; ".join(cls_parts)))
+        overview_data.append([
+            Paragraph("Classification Distribution", styles["cell_label"]),
+            Paragraph(";  ".join(cls_parts), styles["cell_value"]),
+        ])
 
-    ov_table = doc.add_table(rows=len(overview_items), cols=2)
-    ov_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    ov_table.style = "Table Grid"
-    for i, (label, value) in enumerate(overview_items):
-        cell_l = ov_table.rows[i].cells[0]
-        cell_l.text = ""
-        p = cell_l.paragraphs[0]
-        run = p.add_run(label)
-        run.bold = True
-        run.font.size = Pt(9)
-        set_cell_shading(cell_l, "E8EDF3")
-
-        cell_r = ov_table.rows[i].cells[1]
-        cell_r.text = ""
-        p = cell_r.paragraphs[0]
-        run = p.add_run(value)
-        run.font.size = Pt(9)
-
-    for row_obj in ov_table.rows:
-        row_obj.cells[0].width = Inches(2.5)
-        row_obj.cells[1].width = Inches(4.2)
-
-    doc.add_paragraph("")
+    ov_table = Table(overview_data, colWidths=[2.5 * inch, 4.2 * inch])
+    ov_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+        ("BACKGROUND", (0, 0), (0, -1), LIGHT_BLUE_BG),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(ov_table)
+    story.append(Spacer(1, 12))
 
     # ── Key Findings ──────────────────────────────────────────────────────────
-    _styled_heading(doc, "Key Findings")
+    story.append(Paragraph("Key Findings", styles["h2"]))
     for finding in narrative.get("key_findings", []):
-        p = doc.add_paragraph(finding, style="List Bullet")
-        p.paragraph_format.space_after = Pt(2)
+        story.append(Paragraph(f"• {finding}", styles["bullet"]))
+    story.append(Spacer(1, 8))
 
     # ── Drug Score Summary Table ──────────────────────────────────────────────
-    _styled_heading(doc, "MoA Innovation Score Summary")
+    story.append(Paragraph("MoA Innovation Score Summary", styles["h2"]))
 
-    cols = ["drug_name", "indication", "moa_classification", "score", "guardrail",
-            "confidence_tier", "analysis_date"]
-    display_cols = ["Drug", "Indication", "Classification", "Score", "Guardrail",
-                    "Confidence", "Date"]
+    display_cols = ["Drug", "Indication", "Classification", "Score", "Guardrail", "Confidence", "Date"]
+    data_cols = ["drug_name", "indication", "moa_classification", "score", "guardrail",
+                 "confidence_tier", "analysis_date"]
 
-    table = doc.add_table(rows=1, cols=len(cols))
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
+    header_row = [Paragraph(c, styles["cell_header"]) for c in display_cols]
+    table_data = [header_row]
 
-    for i, label in enumerate(display_cols):
-        cell = table.rows[0].cells[i]
-        cell.text = ""
-        p = cell.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(label)
-        run.bold = True
-        run.font.size = Pt(8)
-        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        set_cell_shading(cell, "1F3864")
+    col_widths = [1.1 * inch, 1.2 * inch, 1.15 * inch, 0.5 * inch, 0.7 * inch, 0.85 * inch, 0.9 * inch]
 
-    for _, row in df.iterrows():
-        row_cells = table.add_row().cells
-        for i, col in enumerate(cols):
+    score_cell_style_overrides = []  # (row_idx, col_idx, color)
+
+    for row_i, (_, row) in enumerate(df.iterrows(), start=1):
+        cells = []
+        for col_i, col in enumerate(data_cols):
             val = row.get(col, "")
-            cell = row_cells[i]
-            cell.text = ""
-            p = cell.paragraphs[0]
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = p.add_run(str(val) if pd.notna(val) else "N/A")
-            run.font.size = Pt(8)
+            val_str = str(val) if pd.notna(val) else "N/A"
 
             if col == "score":
-                try:
-                    score_int = int(float(val))
-                    if score_int in SCORE_COLOR_MAP:
-                        run.font.color.rgb = SCORE_COLOR_MAP[score_int]
-                        run.bold = True
-                except (ValueError, TypeError):
-                    pass
+                color = _score_color(val)
+                cell_style = ParagraphStyle(
+                    f"ScoreCell_{row_i}",
+                    parent=styles["cell"],
+                    textColor=color,
+                    fontName="Helvetica-Bold",
+                )
+                cells.append(Paragraph(val_str, cell_style))
             elif col == "moa_classification":
-                cls_str = str(val)
-                for cls_key, cls_color in CLASSIFICATION_COLORS.items():
-                    if cls_key.lower() in cls_str.lower():
-                        run.font.color.rgb = cls_color
-                        run.bold = True
-                        break
+                color = _classification_color(val_str)
+                cell_style = ParagraphStyle(
+                    f"ClsCell_{row_i}",
+                    parent=styles["cell"],
+                    textColor=color,
+                    fontName="Helvetica-Bold",
+                )
+                cells.append(Paragraph(val_str, cell_style))
             elif col == "guardrail":
-                if str(val) == "PASS":
-                    run.font.color.rgb = RGBColor(0x00, 0x80, 0x00)
-                    run.bold = True
-                elif str(val) == "FAIL":
-                    run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-                    run.bold = True
+                if val_str == "PASS":
+                    color = GUARDRAIL_PASS_COLOR
+                elif val_str == "FAIL":
+                    color = GUARDRAIL_FAIL_COLOR
+                else:
+                    color = colors.black
+                cell_style = ParagraphStyle(
+                    f"GRCell_{row_i}",
+                    parent=styles["cell"],
+                    textColor=color,
+                    fontName="Helvetica-Bold",
+                )
+                cells.append(Paragraph(val_str, cell_style))
+            else:
+                cells.append(Paragraph(val_str, styles["cell"]))
+        table_data.append(cells)
 
-    widths = [Inches(1.1), Inches(1.2), Inches(1.1), Inches(0.5),
-              Inches(0.7), Inches(0.8), Inches(0.8)]
-    for row_obj in table.rows:
-        for i, cell in enumerate(row_obj.cells):
-            cell.width = widths[i]
+    score_table = Table(table_data, colWidths=col_widths, repeatRows=1)
 
-    doc.add_paragraph("")
+    row_bg_commands = []
+    for i in range(1, len(table_data)):
+        bg = LIGHT_BLUE_BG if i % 2 == 0 else WHITE
+        row_bg_commands.append(("BACKGROUND", (0, i), (-1, i), bg))
+
+    score_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), DARK_BLUE),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        *row_bg_commands,
+    ]))
+    story.append(score_table)
+    story.append(Spacer(1, 12))
 
     # ── Classification Analysis ───────────────────────────────────────────────
     cls_text = narrative.get("classification_analysis", "")
     if cls_text:
-        _styled_heading(doc, "Classification Analysis")
-        doc.add_paragraph(cls_text)
+        story.append(Paragraph("Classification Analysis", styles["h2"]))
+        story.append(Paragraph(cls_text, styles["body"]))
+        story.append(Spacer(1, 8))
 
     # ── Risk & Strength Highlights ────────────────────────────────────────────
-    _styled_heading(doc, "Risk & Strength Analysis")
+    story.append(Paragraph("Risk &amp; Strength Analysis", styles["h2"]))
 
-    p = doc.add_paragraph()
-    run = p.add_run("Weak / At-Risk Drugs")
-    run.bold = True
-    run.font.size = Pt(11)
-    run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-    doc.add_paragraph(narrative.get("risk_highlights", "N/A"))
+    story.append(Paragraph(
+        '<font color="#CC0000"><b>Weak / At-Risk Drugs</b></font>',
+        styles["h3"],
+    ))
+    story.append(Paragraph(narrative.get("risk_highlights", "N/A"), styles["body"]))
+    story.append(Spacer(1, 6))
 
-    p = doc.add_paragraph()
-    run = p.add_run("Strongest Innovators")
-    run.bold = True
-    run.font.size = Pt(11)
-    run.font.color.rgb = RGBColor(0x00, 0x80, 0x00)
-    doc.add_paragraph(narrative.get("strength_highlights", "N/A"))
+    story.append(Paragraph(
+        '<font color="#008000"><b>Strongest Innovators</b></font>',
+        styles["h3"],
+    ))
+    story.append(Paragraph(narrative.get("strength_highlights", "N/A"), styles["body"]))
+    story.append(Spacer(1, 12))
 
     # ── Per-Drug Breakdown ────────────────────────────────────────────────────
     per_drug = narrative.get("per_drug_narratives", {})
     if per_drug:
-        _styled_heading(doc, "Drug-Level Analysis")
+        story.append(Paragraph("Drug-Level Analysis", styles["h2"]))
 
         for drug_name, drug_narrative in per_drug.items():
-            h3 = doc.add_heading(drug_name, level=3)
-            for run in h3.runs:
-                run.font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-                run.font.size = Pt(11)
-
             drug_stat = stats.get("per_drug_stats", {}).get(drug_name, {})
+
+            block = []
+            block.append(Paragraph(drug_name, styles["h3"]))
+
             if drug_stat:
-                stat_p = doc.add_paragraph()
-                stat_run = stat_p.add_run(
+                block.append(Paragraph(
                     f"Score: {drug_stat.get('score', 'N/A')}/5  |  "
                     f"Classification: {drug_stat.get('classification', 'N/A')}  |  "
                     f"Guardrail: {drug_stat.get('guardrail', 'N/A')}  |  "
-                    f"Confidence: {drug_stat.get('confidence_tier', 'N/A')}"
-                )
-                stat_run.font.size = Pt(9)
-                stat_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-                stat_run.italic = True
+                    f"Confidence: {drug_stat.get('confidence_tier', 'N/A')}",
+                    styles["stat"],
+                ))
 
-            doc.add_paragraph(drug_narrative)
+            block.append(Paragraph(drug_narrative, styles["body"]))
+            story.append(KeepTogether(block))
+            story.append(Spacer(1, 6))
 
     # ── Scoring Framework ─────────────────────────────────────────────────────
-    _styled_heading(doc, "MoA Innovation Scoring Framework")
+    story.append(Paragraph("MoA Innovation Scoring Framework", styles["h2"]))
 
     framework = [
         ("5", "Exceptional", "True First-in-Class: novel mechanism, strong rationale, class-creating potential"),
@@ -503,70 +625,56 @@ def build_report(df: pd.DataFrame, output_path: str):
         ("1", "Poor", "Weak biological rationale or clinically invalidated mechanism"),
     ]
 
-    sf_table = doc.add_table(rows=1, cols=3)
-    sf_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    sf_table.style = "Table Grid"
-    for i, label in enumerate(["Score", "Label", "Description"]):
-        cell = sf_table.rows[0].cells[i]
-        cell.text = ""
-        p = cell.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(label)
-        run.bold = True
-        run.font.size = Pt(9)
-        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        set_cell_shading(cell, "1F3864")
-
+    fw_header = [
+        Paragraph("Score", styles["cell_header"]),
+        Paragraph("Label", styles["cell_header"]),
+        Paragraph("Description", styles["cell_header"]),
+    ]
+    fw_data = [fw_header]
     for sc, lbl, desc in framework:
-        row_cells = sf_table.add_row().cells
-        row_cells[0].text = ""
-        p = row_cells[0].paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(sc)
-        run.bold = True
-        run.font.size = Pt(9)
-        set_cell_shading(row_cells[0], "E8EDF3")
+        fw_data.append([
+            Paragraph(sc, ParagraphStyle("FWScore", parent=styles["cell"], fontName="Helvetica-Bold")),
+            Paragraph(lbl, ParagraphStyle("FWLabel", parent=styles["cell"], fontName="Helvetica-Bold")),
+            Paragraph(desc, ParagraphStyle("FWDesc", parent=styles["cell"], alignment=TA_LEFT)),
+        ])
 
-        row_cells[1].text = ""
-        p = row_cells[1].paragraphs[0]
-        run = p.add_run(lbl)
-        run.bold = True
-        run.font.size = Pt(9)
+    fw_table = Table(fw_data, colWidths=[0.5 * inch, 1.2 * inch, 4.6 * inch])
+    fw_row_bgs = []
+    for i in range(1, len(fw_data)):
+        bg = LIGHT_BLUE_BG if i % 2 == 0 else WHITE
+        fw_row_bgs.append(("BACKGROUND", (0, i), (-1, i), bg))
 
-        row_cells[2].text = ""
-        p = row_cells[2].paragraphs[0]
-        p.add_run(desc).font.size = Pt(9)
+    fw_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), DARK_BLUE),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (1, -1), "CENTER"),
+        ("ALIGN", (2, 1), (2, -1), "LEFT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        *fw_row_bgs,
+    ]))
+    story.append(fw_table)
+    story.append(Spacer(1, 10))
 
-    fw_widths = [Inches(0.5), Inches(1.2), Inches(4.6)]
-    for row_obj in sf_table.rows:
-        for i, cell in enumerate(row_obj.cells):
-            cell.width = fw_widths[i]
-
-    doc.add_paragraph("")
-
-    # ── Score Legend ───────────────────────────────────────────────────────────
-    p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(10)
-    run = p.add_run("Score Legend: ")
-    run.bold = True
-    run.font.size = Pt(8)
-    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+    # ── Score Legend ──────────────────────────────────────────────────────────
     legend_text = "  |  ".join(f"{k} = {v}" for k, v in SCORE_LABEL.items())
-    run = p.add_run(legend_text)
-    run.font.size = Pt(8)
-    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+    story.append(Paragraph(
+        f"<b>Score Legend:</b>  {legend_text}",
+        ParagraphStyle("Legend", parent=styles["body"], fontSize=8, textColor=LIGHT_GRAY),
+    ))
 
     # ── Footer ────────────────────────────────────────────────────────────────
-    p = doc.add_paragraph()
-    run = p.add_run(
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceBefore=14))
+    story.append(Paragraph(
         "This report was auto-generated from MoA Innovation Scorer output "
-        "using Gemini for narrative analysis."
-    )
-    run.font.size = Pt(7)
-    run.font.italic = True
-    run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+        "using Gemini for narrative analysis.",
+        styles["footer"],
+    ))
 
-    doc.save(output_path)
+    doc.build(story)
     print(f"\n✅ MoA report saved → {output_path}")
 
 
@@ -592,7 +700,7 @@ def upload_to_gcs(local_path: str, drug_names: list) -> list:
             blob = bucket.blob(blob_name)
             blob.upload_from_filename(
                 local_path,
-                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                content_type="application/pdf",
             )
             gcs_uris.append(gcs_uri)
         except Exception as e:
@@ -612,7 +720,7 @@ def generate_moa_report(molecule: str = None, output_path: str = None) -> str:
 
     if output_path is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"moa_innovation_report_{ts}.docx"
+        output_path = f"moa_innovation_report_{ts}.pdf"
 
     df = load_from_bigquery(molecule)
     if df.empty:
@@ -637,8 +745,8 @@ def generate_moa_report(molecule: str = None, output_path: str = None) -> str:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate MoA Innovation Word report from BigQuery")
-    parser.add_argument("--output", "-o", default=None, help="Output .docx path")
+    parser = argparse.ArgumentParser(description="Generate MoA Innovation PDF report from BigQuery")
+    parser.add_argument("--output", "-o", default=None, help="Output .pdf path")
     parser.add_argument("--molecule", default=None, help="Filter to a specific molecule")
     args = parser.parse_args()
 
