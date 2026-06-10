@@ -1,0 +1,90 @@
+(cognito) C:\Users\P90022569\Downloads\mustafa_code\drl-cognito-ai-mustafa-code>python market_potential/run_all.py --molecule Semaglutide --dimensions 1,6
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+======================================================================
+MARKET POTENTIAL — ALL DIMENSIONS PIPELINE
+Started: 2026-06-10 08:06:37 UTC
+Dimensions: ['1', '6']
+======================================================================
+Mode: Single molecule (Semaglutide)
+Molecules to process: 1
+----------------------------------------------------------------------
+Execution pool: max_concurrency=1, molecules=1, dimensions=['1', '6']
+
+======================================================================
+  MOLECULE: Semaglutide
+  Dimensions: 1, 6
+  Started: 2026-06-10 13:36:37
+======================================================================
+
+────────────────────────────────────────────────────────────
+[Dim 1] MoA Innovation → Semaglutide
+────────────────────────────────────────────────────────────
+================================================================================
+MOA INNOVATION ASSESSMENT
+Drug: Semaglutide
+Started: 2026-06-10 13:36:37
+================================================================================
+[MoA Step 1] Querying BigQuery for Semaglutide MoA data...
+  Found 8 indication(s): ['Obesity', 'Type 2 Diabetes, Obesity', 'Diabetes, Obesity', 'Obesity, Type 2 Diabetes', 'Obesity, Overweight, Type 2 Diabetes', 'Obesity, Overweight', 'Type 2 Diabetes', 'Type 2 Diabetes, Diabetic Nephropathy, Cardiovascular Risk Factors']
+  Multiple indications found, identifying primary indication...
+  LLM selected: Type 2 Diabetes
+  Primary indication selected: Type 2 Diabetes
+
+[MoA] Using: MoA='Glucagon Like Peptide 1 Receptor (GLP1R) Agonist', Indication='Type 2 Diabetes'
+
+[MoA Step 2] Building mechanism landscape for Type 2 Diabetes...
+  Found 32 approved drugs, 3 pipeline drugs
+[MoA Step 3] Classifying MoA position...
+
+[MoA] ERROR after 609.5s: AttributeError: 'list' object has no attribute 'get'
+Traceback (most recent call last):
+  File "C:\Users\P90022569\Downloads\mustafa_code\drl-cognito-ai-mustafa-code\market_potential\moa_innovation.py", line 1061, in get_moa_innovation_assessment
+    step3_result = await _step3_classify_moa_position(drug_name, moa, ind, step2_result)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\P90022569\Downloads\mustafa_code\drl-cognito-ai-mustafa-code\market_potential\moa_innovation.py", line 387, in _step3_classify_moa_position
+    if result and not result.get("raw_response"):
+                      ^^^^^^^^^^
+AttributeError: 'list' object has no attribute 'get'
+[Dim 1] Semaglutide → Score: N/A/5, Class: N/A (609.5s)
+
+────────────────────────────────────────────────────────────
+[Dim 6] Tolerability → Semaglutide
+────────────────────────────────────────────────────────────
+
+================================================================================
+TWO-STEP GEMINI EXTRACTION
+(Individual Registry Search)
+================================================================================
+
+Molecule: Semaglutide
+Models:
+  Search (Step 1):     gemini-3-flash-preview
+  Extraction (Step 2): gemini-3-flash-preview
+Strategy:
+  Step 1: Search EACH registry individually (parallel)
+  Step 2: Query detailed data in batches of 8 (accurate extraction)
+  Registries: 8
+  Max concurrent workers: 8
+
+================================================================================
+STEP 1: Searching ALL registries INDIVIDUALLY for Semaglutide
+Using model: gemini-3-flash-preview
+Searching 8 registries in parallel
+================================================================================
+
+  📋 Queuing: ClinicalTrials.gov (US/Global)
+  📋 Queuing: ChiCTR (China)
+  📋 Queuing: EU Clinical Trials Register (Europe)
+  📋 Queuing: CTRI (India)
+  📋 Queuing: JRCT (Japan)
+  📋 Queuing: ANZCTR (Australia/New Zealand)
+  📋 Queuing: CRIS (Korea)
+  📋 Queuing: ReBEC (Brazil)
+
+🚀 Launching 8 parallel searches...
+
+C:\Users\P90022569\.conda\envs\cognito\Lib\site-packages\google\genai\_common.py:651: UserWarning: TOO_MANY_TOOL_CALLS is not a valid FinishReason
+  warnings.warn(f'{value} is not a valid {cls.__name__}')
