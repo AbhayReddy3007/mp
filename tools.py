@@ -24,6 +24,8 @@ from market_potential.clinical_efficacy_scorer import compute_clinical_efficacy_
 PROJECT_ID = os.getenv("PROJECT_ID")
 DATASET_ID = os.getenv("BQ_DATASET_ID")
 CLINICAL_EFFICACY_TABLE = "clinical_efficacy"
+MOA_INNOVATION_TABLE = "moa_innovation_table"
+TOLERABILITY_TABLE = "tolerability_table"
 
 
 def _get_bq_client() -> bigquery.Client:
@@ -238,6 +240,386 @@ def save_clinical_efficacy_to_bq(molecule_name: str, trials: list, score_result:
         print(f"[BQ] Insert errors for {molecule_name}: {errors[:3]}")
     else:
         print(f"[BQ] Saved {len(rows)} NEW trials for {molecule_name} (skipped {skipped} unchanged, updated {updated_count})")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MoA Innovation — BigQuery persistence
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ensure_moa_innovation_table():
+    """Create moa_innovation_table if it doesn't exist."""
+    client = _get_bq_client()
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.{MOA_INNOVATION_TABLE}"
+
+    schema = [
+        bigquery.SchemaField("drug_name", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("indication", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("mechanism_statement", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("moa_classification", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("score", "INTEGER", mode="NULLABLE"),
+        bigquery.SchemaField("guardrail", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("confidence_score", "FLOAT", mode="NULLABLE"),
+        bigquery.SchemaField("confidence_tier", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("justification_mechanism_summary", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("justification_novelty_vs_soc", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("justification_competitor_comparison", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("justification_biological_rationale", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("justification_prior_validation_failure", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("justification_why_not_higher_score", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("narrative_rationale", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("sources_primary", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("sources_secondary", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("sources_tertiary", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("analysis_date", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("processing_time_seconds", "FLOAT", mode="NULLABLE"),
+        bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP", mode="NULLABLE"),
+    ]
+
+    table = bigquery.Table(table_id, schema=schema)
+    try:
+        client.create_table(table)
+        print(f"[BQ] Created table: {table_id}")
+    except Exception as e:
+        if "Already Exists" in str(e):
+            pass
+        else:
+            print(f"[BQ] Table check: {e}")
+
+
+def save_moa_innovation_to_bq(result: dict):
+    """Save MoA Innovation assessment to BigQuery (upsert by drug_name + indication).
+
+    - If a row with the same drug_name + indication exists and the score or
+      classification changed, it is updated.
+    - If the row is unchanged, it is skipped.
+    - Otherwise a new row is inserted.
+    """
+    import json as _json
+
+    client = _get_bq_client()
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.{MOA_INNOVATION_TABLE}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    _ensure_moa_innovation_table()
+
+    drug_name = result.get("drug_name", "")
+    indication = result.get("indication", "")
+    if not drug_name:
+        print("[BQ] No drug_name in MoA result — skipping save")
+        return
+
+    # Check for existing row
+    check_query = f"""
+    SELECT score, moa_classification
+    FROM `{table_id}`
+    WHERE drug_name = @drug_name AND indication = @indication
+    LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("drug_name", "STRING", drug_name),
+            bigquery.ScalarQueryParameter("indication", "STRING", indication),
+        ]
+    )
+    existing = None
+    try:
+        rows = list(client.query(check_query, job_config=job_config).result())
+        if rows:
+            existing = rows[0]
+    except Exception:
+        pass
+
+    new_score = result.get("score")
+    new_score = int(new_score) if isinstance(new_score, (int, float)) and new_score == new_score else None
+    new_classification = result.get("moa_classification", "")
+
+    justification = result.get("justification", {})
+    sources = result.get("sources_used", {})
+
+    if existing:
+        old_score = existing.score
+        old_class = existing.moa_classification or ""
+        if old_score == new_score and old_class == new_classification:
+            print(f"[BQ] MoA unchanged for {drug_name} ({indication}) — skipping")
+            return
+
+        # Update
+        update_query = f"""
+        UPDATE `{table_id}`
+        SET score = @score,
+            moa_classification = @moa_classification,
+            mechanism_statement = @mechanism_statement,
+            guardrail = @guardrail,
+            confidence_score = @confidence_score,
+            confidence_tier = @confidence_tier,
+            justification_mechanism_summary = @j_mech,
+            justification_novelty_vs_soc = @j_novelty,
+            justification_competitor_comparison = @j_comp,
+            justification_biological_rationale = @j_bio,
+            justification_prior_validation_failure = @j_fail,
+            justification_why_not_higher_score = @j_why,
+            narrative_rationale = @narrative,
+            sources_primary = @src_pri,
+            sources_secondary = @src_sec,
+            sources_tertiary = @src_ter,
+            analysis_date = @analysis_date,
+            processing_time_seconds = @proc_time,
+            updated_at = @updated_at
+        WHERE drug_name = @drug_name AND indication = @indication
+        """
+        upd_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("score", "INTEGER", new_score),
+                bigquery.ScalarQueryParameter("moa_classification", "STRING", new_classification),
+                bigquery.ScalarQueryParameter("mechanism_statement", "STRING", result.get("mechanism_statement", "")),
+                bigquery.ScalarQueryParameter("guardrail", "STRING", result.get("guardrail", "")),
+                bigquery.ScalarQueryParameter("confidence_score", "FLOAT64", float(result.get("confidence_score", 0.0))),
+                bigquery.ScalarQueryParameter("confidence_tier", "STRING", result.get("confidence_tier", "")),
+                bigquery.ScalarQueryParameter("j_mech", "STRING", justification.get("mechanism_summary", "")),
+                bigquery.ScalarQueryParameter("j_novelty", "STRING", justification.get("novelty_vs_soc", "")),
+                bigquery.ScalarQueryParameter("j_comp", "STRING", justification.get("competitor_comparison", "")),
+                bigquery.ScalarQueryParameter("j_bio", "STRING", justification.get("biological_rationale", "")),
+                bigquery.ScalarQueryParameter("j_fail", "STRING", justification.get("prior_validation_failure", "")),
+                bigquery.ScalarQueryParameter("j_why", "STRING", justification.get("why_not_higher_score", "")),
+                bigquery.ScalarQueryParameter("narrative", "STRING", result.get("narrative_rationale", "")),
+                bigquery.ScalarQueryParameter("src_pri", "STRING", _json.dumps(sources.get("primary", []), default=str)),
+                bigquery.ScalarQueryParameter("src_sec", "STRING", _json.dumps(sources.get("secondary", []), default=str)),
+                bigquery.ScalarQueryParameter("src_ter", "STRING", _json.dumps(sources.get("tertiary", []), default=str)),
+                bigquery.ScalarQueryParameter("analysis_date", "STRING", result.get("analysis_date", "")),
+                bigquery.ScalarQueryParameter("proc_time", "FLOAT64", float(result.get("processing_time_seconds", 0.0))),
+                bigquery.ScalarQueryParameter("updated_at", "TIMESTAMP", now),
+                bigquery.ScalarQueryParameter("drug_name", "STRING", drug_name),
+                bigquery.ScalarQueryParameter("indication", "STRING", indication),
+            ]
+        )
+        try:
+            client.query(update_query, job_config=upd_config).result()
+            print(f"[BQ] Updated MoA for {drug_name} ({indication}) — score {old_score}→{new_score}")
+        except Exception as e:
+            print(f"[BQ] MoA update error for {drug_name}: {e}")
+        return
+
+    # Insert new row
+    row = {
+        "drug_name": drug_name,
+        "indication": indication,
+        "mechanism_statement": result.get("mechanism_statement", ""),
+        "moa_classification": new_classification,
+        "score": new_score,
+        "guardrail": result.get("guardrail", ""),
+        "confidence_score": float(result.get("confidence_score", 0.0)),
+        "confidence_tier": result.get("confidence_tier", ""),
+        "justification_mechanism_summary": justification.get("mechanism_summary", ""),
+        "justification_novelty_vs_soc": justification.get("novelty_vs_soc", ""),
+        "justification_competitor_comparison": justification.get("competitor_comparison", ""),
+        "justification_biological_rationale": justification.get("biological_rationale", ""),
+        "justification_prior_validation_failure": justification.get("prior_validation_failure", ""),
+        "justification_why_not_higher_score": justification.get("why_not_higher_score", ""),
+        "narrative_rationale": result.get("narrative_rationale", ""),
+        "sources_primary": _json.dumps(sources.get("primary", []), default=str),
+        "sources_secondary": _json.dumps(sources.get("secondary", []), default=str),
+        "sources_tertiary": _json.dumps(sources.get("tertiary", []), default=str),
+        "analysis_date": result.get("analysis_date", ""),
+        "processing_time_seconds": float(result.get("processing_time_seconds", 0.0)),
+        "created_at": now,
+    }
+
+    errors = client.insert_rows_json(table_id, [row])
+    if errors:
+        print(f"[BQ] MoA insert errors for {drug_name}: {errors[:3]}")
+    else:
+        print(f"[BQ] Saved MoA assessment for {drug_name} ({indication}) — score {new_score}/5")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tolerability — BigQuery persistence
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ensure_tolerability_table():
+    """Create tolerability_table if it doesn't exist."""
+    client = _get_bq_client()
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.{TOLERABILITY_TABLE}"
+
+    schema = [
+        bigquery.SchemaField("molecule_name", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("tolerability_score", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("score_numeric", "INTEGER", mode="NULLABLE"),
+        bigquery.SchemaField("discontinuation_rate_drug", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("discontinuation_rate_soc", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("soc_source", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("difference", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("key_aes", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("ae_frequency", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("ae_severity", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("vs_placebo", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("vs_soc", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("guardrail", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("guardrail_reason", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("justification", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("base_score", "INTEGER", mode="NULLABLE"),
+        bigquery.SchemaField("soc_adjustment", "INTEGER", mode="NULLABLE"),
+        bigquery.SchemaField("burden_adjustment", "INTEGER", mode="NULLABLE"),
+        bigquery.SchemaField("trials_used", "INTEGER", mode="NULLABLE"),
+        bigquery.SchemaField("total_trials_extracted", "INTEGER", mode="NULLABLE"),
+        bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP", mode="NULLABLE"),
+    ]
+
+    table = bigquery.Table(table_id, schema=schema)
+    try:
+        client.create_table(table)
+        print(f"[BQ] Created table: {table_id}")
+    except Exception as e:
+        if "Already Exists" in str(e):
+            pass
+        else:
+            print(f"[BQ] Table check: {e}")
+
+
+def save_tolerability_to_bq(molecule_name: str, score_result: dict):
+    """Save Tolerability assessment to BigQuery (upsert by molecule_name).
+
+    - If the molecule already exists and the score changed, update it.
+    - If unchanged, skip.
+    - Otherwise insert a new row.
+    """
+    client = _get_bq_client()
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.{TOLERABILITY_TABLE}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    _ensure_tolerability_table()
+
+    if not molecule_name:
+        print("[BQ] No molecule_name for tolerability — skipping save")
+        return
+
+    new_score_numeric = score_result.get("score_numeric")
+    if isinstance(new_score_numeric, (int, float)):
+        new_score_numeric = int(new_score_numeric)
+    else:
+        new_score_numeric = None
+
+    # Check for existing row
+    check_query = f"""
+    SELECT score_numeric, guardrail
+    FROM `{table_id}`
+    WHERE molecule_name = @molecule_name
+    LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("molecule_name", "STRING", molecule_name),
+        ]
+    )
+    existing = None
+    try:
+        rows = list(client.query(check_query, job_config=job_config).result())
+        if rows:
+            existing = rows[0]
+    except Exception:
+        pass
+
+    supporting = score_result.get("supporting_data", {})
+    side_effects = score_result.get("side_effect_summary", {})
+    comparison = score_result.get("comparison", {})
+    breakdown = score_result.get("_scoring_breakdown", {})
+
+    if existing:
+        old_score = existing.score_numeric
+        old_guardrail = existing.guardrail or ""
+        new_guardrail = score_result.get("guardrail", "")
+
+        if old_score == new_score_numeric and old_guardrail == new_guardrail:
+            print(f"[BQ] Tolerability unchanged for {molecule_name} — skipping")
+            return
+
+        update_query = f"""
+        UPDATE `{table_id}`
+        SET tolerability_score = @tol_score,
+            score_numeric = @score_num,
+            discontinuation_rate_drug = @disc_drug,
+            discontinuation_rate_soc = @disc_soc,
+            soc_source = @soc_src,
+            difference = @diff,
+            key_aes = @key_aes,
+            ae_frequency = @ae_freq,
+            ae_severity = @ae_sev,
+            vs_placebo = @vs_plac,
+            vs_soc = @vs_soc,
+            guardrail = @guardrail,
+            guardrail_reason = @guardrail_reason,
+            justification = @justification,
+            base_score = @base_score,
+            soc_adjustment = @soc_adj,
+            burden_adjustment = @burden_adj,
+            trials_used = @trials_used,
+            total_trials_extracted = @total_trials,
+            updated_at = @updated_at
+        WHERE molecule_name = @molecule_name
+        """
+        upd_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("tol_score", "STRING", score_result.get("tolerability_score", "")),
+                bigquery.ScalarQueryParameter("score_num", "INTEGER", new_score_numeric),
+                bigquery.ScalarQueryParameter("disc_drug", "STRING", supporting.get("discontinuation_rate_drug", "")),
+                bigquery.ScalarQueryParameter("disc_soc", "STRING", supporting.get("discontinuation_rate_soc", "")),
+                bigquery.ScalarQueryParameter("soc_src", "STRING", supporting.get("soc_source", "")),
+                bigquery.ScalarQueryParameter("diff", "STRING", supporting.get("difference", "")),
+                bigquery.ScalarQueryParameter("key_aes", "STRING", side_effects.get("key_aes", "")),
+                bigquery.ScalarQueryParameter("ae_freq", "STRING", side_effects.get("frequency", "")),
+                bigquery.ScalarQueryParameter("ae_sev", "STRING", side_effects.get("severity", "")),
+                bigquery.ScalarQueryParameter("vs_plac", "STRING", comparison.get("vs_placebo", "")),
+                bigquery.ScalarQueryParameter("vs_soc", "STRING", comparison.get("vs_soc", "")),
+                bigquery.ScalarQueryParameter("guardrail", "STRING", new_guardrail),
+                bigquery.ScalarQueryParameter("guardrail_reason", "STRING", score_result.get("guardrail_reason", "") or ""),
+                bigquery.ScalarQueryParameter("justification", "STRING", score_result.get("justification", "")),
+                bigquery.ScalarQueryParameter("base_score", "INTEGER", int(breakdown.get("base_score", 0))),
+                bigquery.ScalarQueryParameter("soc_adj", "INTEGER", int(breakdown.get("soc_adjustment", 0))),
+                bigquery.ScalarQueryParameter("burden_adj", "INTEGER", int(breakdown.get("burden_adjustment", 0))),
+                bigquery.ScalarQueryParameter("trials_used", "INTEGER", int(breakdown.get("trials_used", 0))),
+                bigquery.ScalarQueryParameter("total_trials", "INTEGER", int(breakdown.get("total_trials_extracted", 0))),
+                bigquery.ScalarQueryParameter("updated_at", "TIMESTAMP", now),
+                bigquery.ScalarQueryParameter("molecule_name", "STRING", molecule_name),
+            ]
+        )
+        try:
+            client.query(update_query, job_config=upd_config).result()
+            print(f"[BQ] Updated tolerability for {molecule_name} — score {old_score}→{new_score_numeric}")
+        except Exception as e:
+            print(f"[BQ] Tolerability update error for {molecule_name}: {e}")
+        return
+
+    # Insert new row
+    row = {
+        "molecule_name": molecule_name,
+        "tolerability_score": score_result.get("tolerability_score", ""),
+        "score_numeric": new_score_numeric,
+        "discontinuation_rate_drug": supporting.get("discontinuation_rate_drug", ""),
+        "discontinuation_rate_soc": supporting.get("discontinuation_rate_soc", ""),
+        "soc_source": supporting.get("soc_source", ""),
+        "difference": supporting.get("difference", ""),
+        "key_aes": side_effects.get("key_aes", ""),
+        "ae_frequency": side_effects.get("frequency", ""),
+        "ae_severity": side_effects.get("severity", ""),
+        "vs_placebo": comparison.get("vs_placebo", ""),
+        "vs_soc": comparison.get("vs_soc", ""),
+        "guardrail": score_result.get("guardrail", ""),
+        "guardrail_reason": score_result.get("guardrail_reason", "") or "",
+        "justification": score_result.get("justification", ""),
+        "base_score": int(breakdown.get("base_score", 0)),
+        "soc_adjustment": int(breakdown.get("soc_adjustment", 0)),
+        "burden_adjustment": int(breakdown.get("burden_adjustment", 0)),
+        "trials_used": int(breakdown.get("trials_used", 0)),
+        "total_trials_extracted": int(breakdown.get("total_trials_extracted", 0)),
+        "created_at": now,
+    }
+
+    errors = client.insert_rows_json(table_id, [row])
+    if errors:
+        print(f"[BQ] Tolerability insert errors for {molecule_name}: {errors[:3]}")
+    else:
+        print(f"[BQ] Saved tolerability for {molecule_name} — score {new_score_numeric}/5")
 
 
 async def get_dimension_iii_efficacy_data(molecule_name: str,
@@ -469,7 +851,16 @@ async def get_dimension_i_moa_innovation(drug_name: str, indication: str = None)
             - sources_used: Primary/Secondary/Tertiary sources
             - markdown_report: Formatted report
     """
-    return await get_moa_innovation_assessment(drug_name, indication)
+    result = await get_moa_innovation_assessment(drug_name, indication)
+
+    # Save to BigQuery (skip if error result)
+    if result.get("score") and not result.get("error"):
+        try:
+            save_moa_innovation_to_bq(result)
+        except Exception as e:
+            print(f"[BQ] MoA save failed for {drug_name} (non-fatal): {e}")
+
+    return result
 
 
 async def get_dimension_vi_tolerability(molecule_name: str, drug_class: str = "GLP-1", indication: str = None) -> dict:
@@ -531,6 +922,13 @@ async def get_dimension_vi_tolerability(molecule_name: str, drug_class: str = "G
     # Add molecule name and trial count to result
     score_result["molecule"] = molecule_name
     score_result["_scoring_breakdown"]["total_trials_extracted"] = len(trials)
+
+    # Save to BigQuery
+    if score_result.get("score_numeric") is not None:
+        try:
+            save_tolerability_to_bq(molecule_name, score_result)
+        except Exception as e:
+            print(f"[BQ] Tolerability save failed for {molecule_name} (non-fatal): {e}")
 
     return score_result
 
