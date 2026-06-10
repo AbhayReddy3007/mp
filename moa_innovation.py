@@ -144,6 +144,9 @@ async def _gemini_search_call(prompt: str, temperature: float = 0) -> dict:
                 data = repair_json(json_str)
                 if isinstance(data, str):
                     data = json.loads(data)
+                # Gemini sometimes wraps the object in an array — unwrap it
+                if isinstance(data, list):
+                    data = data[0] if (data and isinstance(data[0], dict)) else {"raw_response": response.text.strip(), "_parsed_list": data}
                 return data
 
             # Return raw text if no JSON found
@@ -383,6 +386,9 @@ Return JSON:
 }}"""
 
     result = await _gemini_search_call(prompt)
+
+    if isinstance(result, list):
+        result = result[0] if (result and isinstance(result[0], dict)) else {}
 
     if result and not result.get("raw_response"):
         print(f"  Classification: {result.get('moa_classification', 'Unknown')}")
