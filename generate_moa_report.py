@@ -748,16 +748,11 @@ def build_single_drug_report(drug_stats: dict, narrative: dict, output_path: str
     ))
     story.append(HRFlowable(width="100%", thickness=2, color=DARK_BLUE, spaceAfter=12))
 
-    # ── Score summary table ───────────────────────────────────────────────────
-    story.append(Paragraph("Score Summary", styles["h2"]))
-    story.append(_score_summary_table(drug_stats, styles))
-    story.append(Spacer(1, 10))
-
     # ══════════════════════════════════════════════════════════════════════
-    # SECTION A: Executive Summary
+    # Executive Summary
     # ══════════════════════════════════════════════════════════════════════
     story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
-    story.append(Paragraph("A. Executive Summary", styles["h2"]))
+    story.append(Paragraph("Executive Summary", styles["h2"]))
 
     exec_summary = narrative.get("executive_summary", [])
     if isinstance(exec_summary, list):
@@ -767,10 +762,10 @@ def build_single_drug_report(drug_stats: dict, narrative: dict, output_path: str
     story.append(Spacer(1, 6))
 
     # ══════════════════════════════════════════════════════════════════════
-    # SECTION B: Mechanism of Action Overview
+    # SECTION: Mechanism of Action Overview
     # ══════════════════════════════════════════════════════════════════════
     story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
-    story.append(Paragraph("B. Mechanism of Action Overview", styles["h2"]))
+    story.append(Paragraph("Mechanism of Action Overview", styles["h2"]))
 
     moa_overview = narrative.get("moa_overview", {})
     if isinstance(moa_overview, dict):
@@ -794,10 +789,10 @@ def build_single_drug_report(drug_stats: dict, narrative: dict, output_path: str
     story.append(Spacer(1, 6))
 
     # ══════════════════════════════════════════════════════════════════════
-    # SECTION C: Categorization & Rationale
+    # SECTION: Categorization & Rationale
     # ══════════════════════════════════════════════════════════════════════
     story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
-    story.append(Paragraph("C. Categorization &amp; Rationale", styles["h2"]))
+    story.append(Paragraph("Categorization &amp; Rationale", styles["h2"]))
 
     cat_rationale = narrative.get("categorization_rationale", {})
     if isinstance(cat_rationale, dict):
@@ -818,10 +813,10 @@ def build_single_drug_report(drug_stats: dict, narrative: dict, output_path: str
     story.append(Spacer(1, 6))
 
     # ══════════════════════════════════════════════════════════════════════
-    # SECTION D: Scoring & Implications
+    # SECTION: Scoring & Implications
     # ══════════════════════════════════════════════════════════════════════
     story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
-    story.append(Paragraph("D. Scoring &amp; Implications", styles["h2"]))
+    story.append(Paragraph("Scoring &amp; Implications", styles["h2"]))
 
     scoring = narrative.get("scoring_implications", {})
     if isinstance(scoring, dict):
