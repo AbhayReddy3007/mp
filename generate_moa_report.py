@@ -7,11 +7,9 @@ professional PDF report **per drug** using Gemini for narrative generation.
 Only the LATEST row per drug (by created_at) is used.
 
 Report structure (single-drug, business-facing):
-  - Drug Name (top)
-  - MoA Innovation Analysis (subtitle)
-  - Executive Summary
-  - Headline
+  - Headline (one-line implication for this drug)
   - Key Insights with justification
+  - Score (brief reference only)
   - Bottom-line implication
   - Scoring reference table (end of document)
 
@@ -82,7 +80,6 @@ ACCENT_BLUE = colors.HexColor("#2E5FA3")
 WHITE = colors.white
 LIGHT_GRAY = colors.HexColor("#666666")
 DIVIDER_COLOR = colors.HexColor("#D0D7E3")
-BODY_TEXT_COLOR = colors.HexColor("#333333")
 
 SCORE_COLORS = {
     5: colors.HexColor("#008000"),
@@ -138,7 +135,6 @@ def _extract_json(text: str):
 def _get_credentials():
     if CREDENTIALS_PATH and os.path.exists(CREDENTIALS_PATH):
         return service_account.Credentials.from_service_account_file(CREDENTIALS_PATH)
-    print("[Auth] No service account file found — using Application Default Credentials.")
     return None
 
 
@@ -210,8 +206,8 @@ def extract_drug_stats(row: pd.Series) -> dict:
 def generate_drug_narrative(drug_stats: dict) -> dict:
     """
     Generate a business-facing analytical report narrative for a single drug.
-    Returns a dict with: executive_summary, headline, key_insights,
-    score_reference, bottom_line, score_methodology_note.
+    Returns a dict with: headline, key_insights, score_reference,
+    bottom_line, score_methodology_note.
     """
     prompt = f"""You are a senior pharmaceutical business analyst preparing an executive report
 on the Mechanism of Action (MoA) Innovation dimension for a single drug.
@@ -224,44 +220,37 @@ DRUG DATA:
 - MoA score: {drug_stats['score']} / 5  ({drug_stats['score_label']})
 - Guardrail outcome: {drug_stats['guardrail']}
 - Confidence tier: {drug_stats['confidence_tier']}
-- Analysis date: {drug_stats['analysis_date']}
 
 Your task is to generate a business-facing analytical report section that helps senior
 decision-makers quickly understand what this drug's MoA innovation means for the business.
 Follow these rules strictly:
 
-1. EXECUTIVE SUMMARY (appears first in the report)
-   - Write a 3–5 sentence paragraph that synthesises ALL available data about this drug.
-   - Cover the drug's mechanism, indication, classification, score, guardrail outcome,
-     and confidence tier in plain language.
-   - This should give a busy executive a complete picture before reading any further.
-
-2. FOCUS ON CRITICAL INSIGHTS ONLY
+1. FOCUS ON CRITICAL INSIGHTS ONLY
    - Identify the 3 most important findings that materially affect this drug's attractiveness,
      competitive position, or risk profile.
    - Do NOT list all data points. Only surface what truly matters for decision-making.
 
-3. STRONG JUSTIFICATION
+2. STRONG JUSTIFICATION
    - For every insight, explain WHY it matters using simple cause → impact reasoning.
    - Link each observation to its business implication: revenue potential, competitive risk,
      regulatory complexity, or execution feasibility.
 
-4. SCORE REFERENCE (minimal)
+3. SCORE REFERENCE (minimal)
    - Mention the score only once, briefly, as a reference point
      (e.g., "This drug's MoA innovation is rated Strong at 4/5").
    - Do NOT explain how the score was calculated — save that for the very end.
 
-5. NO TECHNICAL JARGON
+4. NO TECHNICAL JARGON
    - Avoid internal model terms, scoring logic details, or evaluation framework language.
    - Write in clear, natural business language a non-scientist executive would understand.
 
-6. EXECUTIVE-FRIENDLY FORMAT
+5. EXECUTIVE-FRIENDLY FORMAT
    - Keep it crisp, confident, and insight-driven.
    - Every statement must add insight or implication — no generic filler.
+   - The entire report (headline + 3 insights + score + bottom-line) must fit within 2 pages.
 
 Respond ONLY with a valid JSON object (no markdown fences, no extra text):
 {{
-  "executive_summary": "<3–5 sentence paragraph synthesising all available data on this drug, covering mechanism, indication, classification, score, guardrail, and confidence — in plain business language>",
   "headline": "<One crisp sentence capturing the single most important business implication of this drug's MoA innovation>",
   "key_insights": [
     {{
@@ -289,19 +278,12 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
 
     # Fallback
     return {
-        "executive_summary": (
-            f"{drug_stats['drug_name']} is being evaluated for {drug_stats['indication']}. "
-            f"It is classified as {drug_stats['classification']} with an MoA score of "
-            f"{drug_stats['score']}/5 ({drug_stats['score_label']}). "
-            f"The guardrail outcome is {drug_stats['guardrail']} at a "
-            f"{drug_stats['confidence_tier']} confidence level."
-        ),
         "headline": f"MoA innovation analysis for {drug_stats['drug_name']} — see details below.",
         "key_insights": [
-            {"insight": "See the scoring reference table for detailed data.", "justification": ""},
+            {"insight": "See the score summary table for detailed data.", "justification": ""},
         ],
         "score_reference": f"MoA score: {drug_stats['score']} / 5 ({drug_stats['score_label']}).",
-        "bottom_line": "Refer to the scoring reference for individual assessment details.",
+        "bottom_line": "Refer to the score summary for individual assessment details.",
         "score_methodology_note": "Scores reflect the novelty and clinical validation of the drug's mechanism of action.",
     }
 
@@ -310,27 +292,21 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
 
 def build_styles():
     base = getSampleStyleSheet()
-
-    # Shared body style — used consistently across ALL narrative paragraph sections
-    body = ParagraphStyle(
-        "Body", parent=base["Normal"],
-        fontSize=10, leading=15,
-        textColor=BODY_TEXT_COLOR,
-        fontName="Helvetica",
-        spaceAfter=6,
-        alignment=TA_JUSTIFY,
-    )
-
     return {
+        "title": ParagraphStyle(
+            "ReportTitle", parent=base["Normal"],
+            fontSize=20, leading=26, textColor=DARK_BLUE,
+            alignment=TA_CENTER, fontName="Helvetica-Bold", spaceAfter=2,
+        ),
         "drug_name_title": ParagraphStyle(
             "DrugNameTitle", parent=base["Normal"],
-            fontSize=20, leading=26, textColor=DARK_BLUE,
+            fontSize=14, leading=18, textColor=ACCENT_BLUE,
             alignment=TA_CENTER, fontName="Helvetica-Bold", spaceAfter=4,
         ),
-        "report_subtitle": ParagraphStyle(
+        "subtitle": ParagraphStyle(
             "ReportSubtitle", parent=base["Normal"],
-            fontSize=13, leading=18, textColor=ACCENT_BLUE,
-            alignment=TA_CENTER, fontName="Helvetica-Bold", spaceAfter=14,
+            fontSize=9, leading=12, textColor=LIGHT_GRAY,
+            alignment=TA_CENTER, fontName="Helvetica", spaceAfter=12,
         ),
         "headline_box": ParagraphStyle(
             "HeadlineBox", parent=base["Normal"],
@@ -343,38 +319,82 @@ def build_styles():
             fontSize=13, leading=16, textColor=DARK_BLUE,
             fontName="Helvetica-Bold", spaceBefore=14, spaceAfter=6,
         ),
-        # All body-level paragraph styles below share the same look
-        "body": body,
-        "executive_summary": body,
+        "h3": ParagraphStyle(
+            "H3", parent=base["Normal"],
+            fontSize=11, leading=14, textColor=DARK_BLUE,
+            fontName="Helvetica-Bold", spaceBefore=10, spaceAfter=4,
+        ),
+        "body": ParagraphStyle(
+            "Body", parent=base["Normal"],
+            fontSize=10, leading=14, textColor=colors.HexColor("#333333"),
+            fontName="Helvetica", spaceAfter=4, alignment=TA_JUSTIFY,
+        ),
+        "insight_label": ParagraphStyle(
+            "InsightLabel", parent=base["Normal"],
+            fontSize=10, leading=14, textColor=DARK_BLUE,
+            fontName="Helvetica", spaceAfter=1, leftIndent=12,
+        ),
         "insight_justification": ParagraphStyle(
-            "InsightJustification", parent=body,
-            spaceAfter=8, leftIndent=16,
+            "InsightJustification", parent=base["Normal"],
+            fontSize=9, leading=13, textColor=colors.HexColor("#444444"),
+            fontName="Helvetica", spaceAfter=6, leftIndent=24,
         ),
         "score_ref": ParagraphStyle(
-            "ScoreRef", parent=body,
-            textColor=LIGHT_GRAY, fontSize=9, leading=13,
+            "ScoreRef", parent=base["Normal"],
+            fontSize=9, leading=12, textColor=LIGHT_GRAY,
+            fontName="Helvetica", spaceAfter=4,
         ),
-        "bottom_line": body,
+        "bottom_line": ParagraphStyle(
+            "BottomLine", parent=base["Normal"],
+            fontSize=10, leading=14, textColor=colors.HexColor("#1A1A1A"),
+            fontName="Helvetica", spaceAfter=4, alignment=TA_JUSTIFY,
+        ),
         "methodology_note": ParagraphStyle(
-            "MethodologyNote", parent=body,
-            fontSize=8, leading=12, textColor=LIGHT_GRAY,
+            "MethodologyNote", parent=base["Normal"],
+            fontSize=8, leading=12, textColor=colors.HexColor("#333333"),
+            fontName="Helvetica", spaceAfter=4, alignment=TA_JUSTIFY,
         ),
         "footer": ParagraphStyle(
             "Footer", parent=base["Normal"],
             fontSize=7, leading=10, textColor=colors.HexColor("#999999"),
             fontName="Helvetica", alignment=TA_CENTER, spaceBefore=10,
         ),
+        "cell": ParagraphStyle(
+            "Cell", parent=base["Normal"],
+            fontSize=8, leading=11, textColor=colors.HexColor("#333333"),
+            fontName="Helvetica", alignment=TA_CENTER,
+        ),
         "cell_header": ParagraphStyle(
             "CellHeader", parent=base["Normal"],
             fontSize=8, leading=11, textColor=WHITE,
             fontName="Helvetica-Bold", alignment=TA_CENTER,
         ),
-        "cell": ParagraphStyle(
-            "Cell", parent=base["Normal"],
-            fontSize=8, leading=11, textColor=BODY_TEXT_COLOR,
-            fontName="Helvetica", alignment=TA_CENTER,
+        "cell_label": ParagraphStyle(
+            "CellLabel", parent=base["Normal"],
+            fontSize=9, leading=12, textColor=colors.HexColor("#333333"),
+            fontName="Helvetica-Bold",
+        ),
+        "cell_value": ParagraphStyle(
+            "CellValue", parent=base["Normal"],
+            fontSize=9, leading=12, textColor=colors.HexColor("#333333"),
+            fontName="Helvetica",
         ),
     }
+
+
+def _score_color(score_val):
+    try:
+        return SCORE_COLORS.get(int(float(score_val)), colors.black)
+    except (ValueError, TypeError):
+        return colors.black
+
+
+def _classification_color(cls_str):
+    cls_lower = str(cls_str).lower()
+    for key, col in CLASSIFICATION_COLORS.items():
+        if key in cls_lower:
+            return col
+    return colors.black
 
 
 def _headline_box(headline_text: str, styles: dict, story: list):
@@ -396,24 +416,63 @@ def _headline_box(headline_text: str, styles: dict, story: list):
 
 
 def _render_key_insights(insights: list, styles: dict, story: list):
-    """
-    Render key insights as bullet points — no 'Insight N:' labels.
-    Each insight is a bold bullet; justification follows indented below it.
-    """
-    for item in insights:
-        insight_text = item.get("insight", "")
-        justification = item.get("justification", "")
-
-        # Bold bullet for the insight statement — explicit font color to stay #333333
+    """Render numbered key insights with indented justification."""
+    for i, item in enumerate(insights, start=1):
         story.append(Paragraph(
-            f'<font color="#333333">&#8226; <b>{insight_text}</b></font>',
-            styles["body"],
+            f"<b>Insight {i}:</b> {item.get('insight', '')}",
+            styles["insight_label"],
         ))
+        justification = item.get("justification", "")
         if justification:
             story.append(Paragraph(
                 f"&#8594; {justification}",
                 styles["insight_justification"],
             ))
+
+
+def _score_summary_table(drug_stats: dict, styles: dict) -> Table:
+    """Render a compact single-drug score summary table."""
+    guardrail_val = drug_stats["guardrail"]
+    guardrail_color = (
+        GUARDRAIL_PASS_COLOR if guardrail_val == "PASS"
+        else GUARDRAIL_FAIL_COLOR if guardrail_val == "FAIL"
+        else colors.black
+    )
+    score_color = _score_color(drug_stats["score"])
+    cls_color = _classification_color(drug_stats["classification"])
+
+    def labeled_cell(label, value, value_color=None):
+        val_style = ParagraphStyle(
+            f"VS_{label}", parent=styles["cell_value"],
+            textColor=value_color or colors.HexColor("#333333"),
+            fontName="Helvetica",
+        )
+        return [
+            Paragraph(label, styles["cell_label"]),
+            Paragraph(value, val_style),
+        ]
+
+    data = [
+        labeled_cell("Drug", drug_stats["drug_name"]),
+        labeled_cell("Indication", drug_stats["indication"]),
+        labeled_cell("Classification", drug_stats["classification"], cls_color),
+        labeled_cell("MoA Score", f"{drug_stats['score']} / 5  ({drug_stats['score_label']})", score_color),
+        labeled_cell("Guardrail", guardrail_val, guardrail_color),
+        labeled_cell("Confidence", drug_stats["confidence_tier"]),
+        labeled_cell("Analysis Date", drug_stats["analysis_date"]),
+    ]
+
+    tbl = Table(data, colWidths=[2.0 * inch, 4.7 * inch])
+    tbl.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+        ("BACKGROUND", (0, 0), (0, -1), LIGHT_BLUE_BG),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    return tbl
 
 
 def _scoring_framework_table(styles: dict) -> Table:
@@ -433,11 +492,9 @@ def _scoring_framework_table(styles: dict) -> Table:
     rows = [header]
     for sc, lbl, desc in framework:
         rows.append([
-            Paragraph(sc,   styles["cell"]),
-            Paragraph(lbl,  styles["cell"]),
-            Paragraph(desc, ParagraphStyle(
-                f"FWDesc_{sc}", parent=styles["cell"], alignment=TA_LEFT,
-            )),
+            Paragraph(sc,   ParagraphStyle("FWScore", parent=styles["cell"], fontName="Helvetica")),
+            Paragraph(lbl,  ParagraphStyle("FWLabel", parent=styles["cell"], fontName="Helvetica")),
+            Paragraph(desc, ParagraphStyle("FWDesc",  parent=styles["cell"], alignment=TA_LEFT)),
         ])
 
     tbl = Table(rows, colWidths=[0.5 * inch, 1.2 * inch, 5.0 * inch])
@@ -478,24 +535,24 @@ def build_single_drug_report(drug_stats: dict, narrative: dict, output_path: str
         author="MoA Innovation Scorer",
     )
 
-    # ── Title block: Drug Name first, then report title ───────────────────────
+    # ── Title block ───────────────────────────────────────────────────────────
+    story.append(Paragraph(REPORT_TITLE, styles["title"]))
     story.append(Paragraph(drug_stats["drug_name"], styles["drug_name_title"]))
-    story.append(Paragraph(REPORT_TITLE, styles["report_subtitle"]))
+    story.append(Paragraph(
+        f"Generated {datetime.now().strftime('%B %d, %Y')}  •  {drug_stats['indication']}",
+        styles["subtitle"],
+    ))
     story.append(HRFlowable(width="100%", thickness=2, color=DARK_BLUE, spaceAfter=12))
-
-    # ── Executive Summary ─────────────────────────────────────────────────────
-    executive_summary = narrative.get("executive_summary", "")
-    if executive_summary:
-        story.append(Paragraph("Executive Summary", styles["h2"]))
-        story.append(Paragraph(executive_summary, styles["executive_summary"]))
-        story.append(Spacer(1, 8))
 
     # ── Headline banner ───────────────────────────────────────────────────────
     headline = narrative.get("headline", "")
     if headline:
         _headline_box(headline, styles, story)
 
-    story.append(Spacer(1, 4))
+    # ── Score summary table ───────────────────────────────────────────────────
+    story.append(Paragraph("Score Summary", styles["h2"]))
+    story.append(_score_summary_table(drug_stats, styles))
+    story.append(Spacer(1, 10))
 
     # ── Key Insights ──────────────────────────────────────────────────────────
     story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
@@ -506,13 +563,12 @@ def build_single_drug_report(drug_stats: dict, narrative: dict, output_path: str
     # ── Score reference ───────────────────────────────────────────────────────
     score_ref = narrative.get("score_reference", "")
     if score_ref:
-        story.append(Paragraph(score_ref, styles["score_ref"]))
+        story.append(Paragraph(f"Score: {score_ref}", styles["score_ref"]))
         story.append(Spacer(1, 4))
 
     # ── Bottom-line implication ───────────────────────────────────────────────
     bottom_line = narrative.get("bottom_line", "")
     if bottom_line:
-        story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
         story.append(Paragraph("Bottom-Line Implication", styles["h2"]))
         story.append(Paragraph(bottom_line, styles["bottom_line"]))
         story.append(Spacer(1, 10))
@@ -532,10 +588,7 @@ def build_single_drug_report(drug_stats: dict, narrative: dict, output_path: str
     legend_text = "  |  ".join(f"{k} = {v}" for k, v in SCORE_LABEL.items())
     story.append(Paragraph(
         f"<b>Score Legend:</b>  {legend_text}",
-        ParagraphStyle(
-            "Legend", parent=styles["body"],
-            fontSize=8, textColor=LIGHT_GRAY,
-        ),
+        ParagraphStyle("Legend", parent=styles["body"], fontSize=8, textColor=LIGHT_GRAY),
     ))
 
     # ── Footer ────────────────────────────────────────────────────────────────
