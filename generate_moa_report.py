@@ -6,10 +6,16 @@ professional PDF report using Gemini for narrative generation.
 
 Only the LATEST row per drug (by created_at) is used.
 
+Report structure follows a business-facing analytical format:
+  - Headline (one-line dimension summary)
+  - Key Insights with justification
+  - Score (brief mention only)
+  - Bottom-line implication
+
 Usage:
-    python market_potential/generate_moa_report.py
-    python market_potential/generate_moa_report.py --molecule Semaglutide
-    python market_potential/generate_moa_report.py --output moa_report.pdf
+    python generate_moa_report.py
+    python generate_moa_report.py --molecule Semaglutide
+    python generate_moa_report.py --output moa_report.pdf
 """
 
 import os
@@ -57,21 +63,23 @@ GCS_BUCKET = "cognito-gcs"
 GCS_BASE_PATH = "Cognito_new/reports"
 GCS_FILE_NAME = "MoA_Innovation_Analysis.pdf"
 
-REPORT_TITLE = "MoA Innovation Scoring Analysis"
+REPORT_TITLE = "MoA Innovation Analysis"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 DARK_BLUE = colors.HexColor("#1F3864")
 LIGHT_BLUE_BG = colors.HexColor("#E8EDF3")
+ACCENT_BLUE = colors.HexColor("#2E5FA3")
 WHITE = colors.white
 LIGHT_GRAY = colors.HexColor("#666666")
 VERY_LIGHT_GRAY = colors.HexColor("#999999")
+DIVIDER_COLOR = colors.HexColor("#D0D7E3")
 
 SCORE_COLORS = {
-    5: colors.HexColor("#008000"),  # Green  – Exceptional
-    4: colors.HexColor("#4CAF50"),  # Light green – Strong
-    3: colors.HexColor("#CC9900"),  # Amber – Moderate
-    2: colors.HexColor("#E65100"),  # Orange-red – Weak
-    1: colors.HexColor("#CC0000"),  # Red – Poor
+    5: colors.HexColor("#008000"),
+    4: colors.HexColor("#4CAF50"),
+    3: colors.HexColor("#CC9900"),
+    2: colors.HexColor("#E65100"),
+    1: colors.HexColor("#CC0000"),
 }
 
 SCORE_LABEL = {
@@ -202,6 +210,15 @@ def compute_statistics(df: pd.DataFrame) -> dict:
 # ── LLM narrative ─────────────────────────────────────────────────────────────
 
 def generate_executive_summary(stats: dict, df: pd.DataFrame) -> dict:
+    """
+    Generate a business-facing analytical narrative using the structured
+    insight report format:
+      - Headline
+      - Key Insights (with justification)
+      - Score reference
+      - Bottom-line implication
+      - Per-drug breakdowns following the same format
+    """
     drug_rows = []
     for _, r in df.iterrows():
         drug_rows.append({
@@ -215,30 +232,82 @@ def generate_executive_summary(stats: dict, df: pd.DataFrame) -> dict:
             "confidence_tier": str(r.get("confidence_tier", "")),
         })
 
-    prompt = f"""You are a senior pharmaceutical analyst writing a MoA Innovation report.
-Based on the data below, produce a thorough analytical report. Be specific — reference
-drug names, classifications, scores, and indications.
+    score_label_map = {5: "Exceptional", 4: "Strong", 3: "Moderate", 2: "Weak", 1: "Poor"}
 
-PORTFOLIO STATISTICS:
+    prompt = f"""You are a senior pharmaceutical business analyst preparing an executive report
+on the Mechanism of Action (MoA) Innovation dimension for a pharmaceutical portfolio.
+
+Your task is to generate a business-facing analytical report that helps senior stakeholders
+make informed decisions. Follow these rules strictly:
+
+1. FOCUS ON CRITICAL INSIGHTS ONLY
+   - Surface the 3 most important findings that materially affect product attractiveness,
+     competitive risk, or market opportunity.
+   - Do NOT list all data points. Only include what truly matters.
+
+2. STRONG JUSTIFICATION
+   - For every insight, explain WHY it matters using simple cause → impact reasoning.
+   - Link each observation to its business implication (revenue potential, competitive risk,
+     regulatory complexity, or execution feasibility).
+
+3. SCORE REFERENCE (minimal)
+   - Mention the overall portfolio score only briefly as a reference point
+     (e.g., "This dimension is rated Moderate overall").
+   - Do NOT explain how the score was calculated. Save that for the very end.
+
+4. NO TECHNICAL JARGON
+   - Avoid internal model terms, scoring logic details, or evaluation framework terminology.
+   - Use clear, natural business language a non-scientist executive would understand.
+
+5. EXECUTIVE-FRIENDLY FORMAT
+   - Keep it crisp, confident, and insight-driven.
+   - Every statement must add insight or implication — no generic filler.
+
+6. STRICT LENGTH: The entire portfolio-level report (headline + insights + score +
+   bottom-line) must fit within 2 printed pages. Per-drug narratives should each be
+   3–5 sentences maximum.
+
+PORTFOLIO DATA:
 - Total drugs assessed: {stats['total_drugs']}
 - Drugs: {', '.join(stats['drugs'])}
-- Average MoA score: {stats['avg_score']} (1=Poor, 5=Exceptional)
-- Score distribution: {json.dumps(stats['score_distribution'])}
-- Classification distribution: {json.dumps(stats['classification_distribution'])}
-- Guardrail: {stats['guardrail_pass']} PASS, {stats['guardrail_fail']} FAIL
+- Average MoA score: {stats['avg_score']} / 5  ({score_label_map.get(round(stats['avg_score']) if stats['avg_score'] else 0, 'N/A')} overall)
+- Score distribution: {json.dumps({score_label_map.get(k, k): v for k, v in stats['score_distribution'].items() if v > 0})}
+- Classification breakdown: {json.dumps(stats['classification_distribution'])}
+- Guardrail outcomes: {stats['guardrail_pass']} PASS, {stats['guardrail_fail']} FAIL
 
 DRUG-LEVEL DATA (JSON):
 {json.dumps(drug_rows, indent=1)}
 
-Respond ONLY with a valid JSON object (no markdown fences):
+Respond ONLY with a valid JSON object (no markdown fences, no extra text):
 {{
-  "executive_summary": "<5-8 sentences overview of the MoA innovation landscape across the assessed drugs>",
-  "key_findings": ["<finding 1 with drug names and scores>", "<finding 2>", "<finding 3>", "<finding 4>"],
-  "classification_analysis": "<4-6 sentences analysing the classification distribution — which drugs are FIC/BIC/Me-too and why>",
-  "risk_highlights": "<3-5 sentences on drugs with low scores or FAIL guardrails>",
-  "strength_highlights": "<3-5 sentences on drugs with high scores and strong innovation>",
+  "headline": "<One crisp sentence summarising the single most important implication of MoA innovation across this portfolio>",
+  "key_insights": [
+    {{
+      "insight": "<Concise insight statement referencing specific drugs where relevant>",
+      "justification": "<Why this matters: cause → business impact, 2–3 sentences>"
+    }},
+    {{
+      "insight": "<Second most important insight>",
+      "justification": "<Why this matters: cause → business impact, 2–3 sentences>"
+    }},
+    {{
+      "insight": "<Third most important insight>",
+      "justification": "<Why this matters: cause → business impact, 2–3 sentences>"
+    }}
+  ],
+  "score_reference": "<One sentence referencing the overall portfolio score level (e.g. Moderate at X.X/5) without methodology details>",
+  "bottom_line": "<2–3 sentences telling the decision-maker what to infer and what action to consider based on this dimension>",
+  "score_methodology_note": "<Brief, plain-language note (2–3 sentences max) at the end explaining in general terms how the overall MoA score was determined — keep it high-level and jargon-free>",
   "per_drug_narratives": {{
-    "<drug_name>": "<3-5 sentence analysis of this drug's MoA innovation, classification rationale, and strategic implications>"
+    "<drug_name>": {{
+      "headline": "<One-line implication for this drug's MoA innovation>",
+      "key_insights": [
+        {{"insight": "<Key insight>", "justification": "<Why it matters, 1–2 sentences>"}},
+        {{"insight": "<Second key insight>", "justification": "<Why it matters, 1–2 sentences>"}}
+      ],
+      "score_reference": "<Brief one-line score reference for this drug>",
+      "bottom_line": "<1–2 sentences: what should the decision-maker infer about this drug?>"
+    }}
   }}
 }}
 """
@@ -246,12 +315,16 @@ Respond ONLY with a valid JSON object (no markdown fences):
     result = _extract_json(text)
     if result:
         return result
+
+    # Fallback if JSON extraction fails
     return {
-        "executive_summary": "Analysis complete. See tables below for details.",
-        "key_findings": ["See detailed tables."],
-        "classification_analysis": "See classification table.",
-        "risk_highlights": "Refer to score tables.",
-        "strength_highlights": "Refer to score tables.",
+        "headline": "MoA innovation analysis complete — see details below.",
+        "key_insights": [
+            {"insight": "See tables below for detailed drug-level data.", "justification": ""},
+        ],
+        "score_reference": f"Portfolio average score: {stats['avg_score']} / 5.",
+        "bottom_line": "Refer to the drug-level tables for individual assessment details.",
+        "score_methodology_note": "Scores reflect the novelty and clinical validation of each drug's mechanism of action.",
         "per_drug_narratives": {},
     }
 
@@ -266,7 +339,7 @@ def build_styles():
             "ReportTitle",
             parent=base["Normal"],
             fontSize=20,
-            leading=24,
+            leading=26,
             textColor=DARK_BLUE,
             alignment=TA_CENTER,
             fontName="Helvetica-Bold",
@@ -281,6 +354,17 @@ def build_styles():
             alignment=TA_CENTER,
             fontName="Helvetica",
             spaceAfter=12,
+        ),
+        "headline_box": ParagraphStyle(
+            "HeadlineBox",
+            parent=base["Normal"],
+            fontSize=11,
+            leading=16,
+            textColor=WHITE,
+            fontName="Helvetica-Bold",
+            alignment=TA_LEFT,
+            spaceAfter=0,
+            leftIndent=0,
         ),
         "h2": ParagraphStyle(
             "H2",
@@ -302,6 +386,16 @@ def build_styles():
             spaceBefore=10,
             spaceAfter=4,
         ),
+        "h3_drug": ParagraphStyle(
+            "H3Drug",
+            parent=base["Normal"],
+            fontSize=11,
+            leading=14,
+            textColor=ACCENT_BLUE,
+            fontName="Helvetica-Bold",
+            spaceBefore=10,
+            spaceAfter=2,
+        ),
         "body": ParagraphStyle(
             "Body",
             parent=base["Normal"],
@@ -309,6 +403,55 @@ def build_styles():
             leading=14,
             textColor=colors.HexColor("#333333"),
             fontName="Helvetica",
+            spaceAfter=4,
+            alignment=TA_JUSTIFY,
+        ),
+        "insight_label": ParagraphStyle(
+            "InsightLabel",
+            parent=base["Normal"],
+            fontSize=10,
+            leading=14,
+            textColor=DARK_BLUE,
+            fontName="Helvetica-Bold",
+            spaceAfter=1,
+            leftIndent=12,
+        ),
+        "insight_justification": ParagraphStyle(
+            "InsightJustification",
+            parent=base["Normal"],
+            fontSize=9,
+            leading=13,
+            textColor=colors.HexColor("#444444"),
+            fontName="Helvetica-Oblique",
+            spaceAfter=6,
+            leftIndent=24,
+        ),
+        "score_ref": ParagraphStyle(
+            "ScoreRef",
+            parent=base["Normal"],
+            fontSize=9,
+            leading=12,
+            textColor=LIGHT_GRAY,
+            fontName="Helvetica-Oblique",
+            spaceAfter=4,
+        ),
+        "bottom_line": ParagraphStyle(
+            "BottomLine",
+            parent=base["Normal"],
+            fontSize=10,
+            leading=14,
+            textColor=colors.HexColor("#1A1A1A"),
+            fontName="Helvetica-Bold",
+            spaceAfter=4,
+            alignment=TA_JUSTIFY,
+        ),
+        "methodology_note": ParagraphStyle(
+            "MethodologyNote",
+            parent=base["Normal"],
+            fontSize=8,
+            leading=12,
+            textColor=LIGHT_GRAY,
+            fontName="Helvetica-Oblique",
             spaceAfter=4,
             alignment=TA_JUSTIFY,
         ),
@@ -396,6 +539,40 @@ def _classification_color(cls_str):
     return colors.black
 
 
+def _headline_box(headline_text: str, styles: dict, story: list):
+    """Render a dark-blue shaded headline banner."""
+    headline_table = Table(
+        [[Paragraph(f"&#9654; {headline_text}", styles["headline_box"])]],
+        colWidths=[6.8 * inch],
+    )
+    headline_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), DARK_BLUE),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(headline_table)
+    story.append(Spacer(1, 8))
+
+
+def _render_key_insights(insights: list, styles: dict, story: list):
+    """Render numbered key insights with justification."""
+    for i, item in enumerate(insights, start=1):
+        insight_text = item.get("insight", "")
+        justification_text = item.get("justification", "")
+        story.append(Paragraph(
+            f"<b>Insight {i}:</b> {insight_text}",
+            styles["insight_label"],
+        ))
+        if justification_text:
+            story.append(Paragraph(
+                f"→ {justification_text}",
+                styles["insight_justification"],
+            ))
+
+
 # ── Report builder ────────────────────────────────────────────────────────────
 
 def build_report(df: pd.DataFrame, output_path: str):
@@ -414,7 +591,7 @@ def build_report(df: pd.DataFrame, output_path: str):
     doc = SimpleDocTemplate(
         output_path,
         pagesize=letter,
-        topMargin=0.8 * inch,
+        topMargin=0.75 * inch,
         bottomMargin=0.6 * inch,
         leftMargin=0.9 * inch,
         rightMargin=0.9 * inch,
@@ -431,13 +608,13 @@ def build_report(df: pd.DataFrame, output_path: str):
     ))
     story.append(HRFlowable(width="100%", thickness=2, color=DARK_BLUE, spaceAfter=12))
 
-    # ── Executive Summary ─────────────────────────────────────────────────────
-    story.append(Paragraph("Executive Summary", styles["h2"]))
-    story.append(Paragraph(narrative.get("executive_summary", ""), styles["body"]))
-    story.append(Spacer(1, 6))
+    # ── Portfolio Headline ────────────────────────────────────────────────────
+    portfolio_headline = narrative.get("headline", "")
+    if portfolio_headline:
+        _headline_box(portfolio_headline, styles, story)
 
-    # ── Portfolio Overview ────────────────────────────────────────────────────
-    story.append(Paragraph("Portfolio Overview", styles["h2"]))
+    # ── Portfolio Overview Table ───────────────────────────────────────────────
+    story.append(Paragraph("Portfolio Snapshot", styles["h2"]))
 
     dist_parts = [
         f"{SCORE_LABEL[s]}: {stats['score_distribution'].get(s, 0)}"
@@ -450,13 +627,11 @@ def build_report(df: pd.DataFrame, output_path: str):
     ]
 
     overview_data = [
-        [Paragraph("Total Drugs Assessed", styles["cell_label"]),
-         Paragraph(str(stats["total_drugs"]), styles["cell_value"])],
-        [Paragraph("Drugs Covered", styles["cell_label"]),
+        [Paragraph("Drugs Assessed", styles["cell_label"]),
          Paragraph(", ".join(stats["drugs"]), styles["cell_value"])],
         [Paragraph("Average MoA Score", styles["cell_label"]),
          Paragraph(f"{stats['avg_score']} / 5" if stats["avg_score"] else "N/A", styles["cell_value"])],
-        [Paragraph("Guardrail Summary", styles["cell_label"]),
+        [Paragraph("Guardrail Outcomes", styles["cell_label"]),
          Paragraph(f"{stats['guardrail_pass']} PASS  |  {stats['guardrail_fail']} FAIL", styles["cell_value"])],
     ]
     if dist_parts:
@@ -466,11 +641,11 @@ def build_report(df: pd.DataFrame, output_path: str):
         ])
     if cls_parts:
         overview_data.append([
-            Paragraph("Classification Distribution", styles["cell_label"]),
+            Paragraph("Classification Breakdown", styles["cell_label"]),
             Paragraph(";  ".join(cls_parts), styles["cell_value"]),
         ])
 
-    ov_table = Table(overview_data, colWidths=[2.5 * inch, 4.2 * inch])
+    ov_table = Table(overview_data, colWidths=[2.2 * inch, 4.5 * inch])
     ov_table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
         ("BACKGROUND", (0, 0), (0, -1), LIGHT_BLUE_BG),
@@ -481,15 +656,28 @@ def build_report(df: pd.DataFrame, output_path: str):
         ("RIGHTPADDING", (0, 0), (-1, -1), 8),
     ]))
     story.append(ov_table)
-    story.append(Spacer(1, 12))
+    story.append(Spacer(1, 10))
 
-    # ── Key Findings ──────────────────────────────────────────────────────────
-    story.append(Paragraph("Key Findings", styles["h2"]))
-    for finding in narrative.get("key_findings", []):
-        story.append(Paragraph(f"• {finding}", styles["bullet"]))
+    # ── Key Insights ──────────────────────────────────────────────────────────
+    story.append(Paragraph("Key Insights", styles["h2"]))
+    _render_key_insights(narrative.get("key_insights", []), styles, story)
     story.append(Spacer(1, 8))
 
+    # ── Score Reference ───────────────────────────────────────────────────────
+    score_ref = narrative.get("score_reference", "")
+    if score_ref:
+        story.append(Paragraph(f"Score: {score_ref}", styles["score_ref"]))
+        story.append(Spacer(1, 4))
+
+    # ── Bottom-Line Implication ───────────────────────────────────────────────
+    bottom_line = narrative.get("bottom_line", "")
+    if bottom_line:
+        story.append(Paragraph("Bottom-Line Implication", styles["h2"]))
+        story.append(Paragraph(bottom_line, styles["bottom_line"]))
+        story.append(Spacer(1, 10))
+
     # ── Drug Score Summary Table ──────────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=10))
     story.append(Paragraph("MoA Innovation Score Summary", styles["h2"]))
 
     display_cols = ["Drug", "Indication", "Classification", "Score", "Guardrail", "Confidence", "Date"]
@@ -500,8 +688,6 @@ def build_report(df: pd.DataFrame, output_path: str):
     table_data = [header_row]
 
     col_widths = [1.1 * inch, 1.2 * inch, 1.15 * inch, 0.5 * inch, 0.7 * inch, 0.85 * inch, 0.9 * inch]
-
-    score_cell_style_overrides = []  # (row_idx, col_idx, color)
 
     for row_i, (_, row) in enumerate(df.iterrows(), start=1):
         cells = []
@@ -566,41 +752,21 @@ def build_report(df: pd.DataFrame, output_path: str):
     story.append(score_table)
     story.append(Spacer(1, 12))
 
-    # ── Classification Analysis ───────────────────────────────────────────────
-    cls_text = narrative.get("classification_analysis", "")
-    if cls_text:
-        story.append(Paragraph("Classification Analysis", styles["h2"]))
-        story.append(Paragraph(cls_text, styles["body"]))
-        story.append(Spacer(1, 8))
-
-    # ── Risk & Strength Highlights ────────────────────────────────────────────
-    story.append(Paragraph("Risk &amp; Strength Analysis", styles["h2"]))
-
-    story.append(Paragraph(
-        '<font color="#CC0000"><b>Weak / At-Risk Drugs</b></font>',
-        styles["h3"],
-    ))
-    story.append(Paragraph(narrative.get("risk_highlights", "N/A"), styles["body"]))
-    story.append(Spacer(1, 6))
-
-    story.append(Paragraph(
-        '<font color="#008000"><b>Strongest Innovators</b></font>',
-        styles["h3"],
-    ))
-    story.append(Paragraph(narrative.get("strength_highlights", "N/A"), styles["body"]))
-    story.append(Spacer(1, 12))
-
     # ── Per-Drug Breakdown ────────────────────────────────────────────────────
     per_drug = narrative.get("per_drug_narratives", {})
     if per_drug:
+        story.append(PageBreak())
         story.append(Paragraph("Drug-Level Analysis", styles["h2"]))
 
         for drug_name, drug_narrative in per_drug.items():
             drug_stat = stats.get("per_drug_stats", {}).get(drug_name, {})
 
             block = []
-            block.append(Paragraph(drug_name, styles["h3"]))
 
+            # Drug name header
+            block.append(Paragraph(drug_name, styles["h3_drug"]))
+
+            # Stat line
             if drug_stat:
                 block.append(Paragraph(
                     f"Score: {drug_stat.get('score', 'N/A')}/5  |  "
@@ -610,12 +776,45 @@ def build_report(df: pd.DataFrame, output_path: str):
                     styles["stat"],
                 ))
 
-            block.append(Paragraph(drug_narrative, styles["body"]))
-            story.append(KeepTogether(block))
-            story.append(Spacer(1, 6))
+            # Drug headline
+            drug_headline = drug_narrative.get("headline", "")
+            if drug_headline:
+                _headline_box(drug_headline, styles, block)
 
-    # ── Scoring Framework ─────────────────────────────────────────────────────
-    story.append(Paragraph("MoA Innovation Scoring Framework", styles["h2"]))
+            # Drug key insights
+            drug_insights = drug_narrative.get("key_insights", [])
+            if drug_insights:
+                block.append(Paragraph("Key Insights", styles["h3"]))
+                _render_key_insights(drug_insights, styles, block)
+
+            # Drug score reference
+            drug_score_ref = drug_narrative.get("score_reference", "")
+            if drug_score_ref:
+                block.append(Paragraph(f"Score: {drug_score_ref}", styles["score_ref"]))
+
+            # Drug bottom line
+            drug_bottom_line = drug_narrative.get("bottom_line", "")
+            if drug_bottom_line:
+                block.append(Paragraph("Bottom-Line", styles["h3"]))
+                block.append(Paragraph(drug_bottom_line, styles["bottom_line"]))
+
+            block.append(HRFlowable(
+                width="100%", thickness=0.5, color=DIVIDER_COLOR,
+                spaceBefore=8, spaceAfter=4,
+            ))
+
+            story.append(KeepTogether(block))
+            story.append(Spacer(1, 4))
+
+    # ── Score Reference / Methodology Note ────────────────────────────────────
+    methodology_note = narrative.get("score_methodology_note", "")
+    if methodology_note:
+        story.append(Spacer(1, 10))
+        story.append(Paragraph("About the MoA Innovation Score", styles["h2"]))
+        story.append(Paragraph(methodology_note, styles["methodology_note"]))
+
+    # ── MoA Scoring Framework Reference Table ─────────────────────────────────
+    story.append(Paragraph("MoA Innovation Scoring Reference", styles["h2"]))
 
     framework = [
         ("5", "Exceptional", "True First-in-Class: novel mechanism, strong rationale, class-creating potential"),
@@ -659,7 +858,7 @@ def build_report(df: pd.DataFrame, output_path: str):
     story.append(fw_table)
     story.append(Spacer(1, 10))
 
-    # ── Score Legend ──────────────────────────────────────────────────────────
+    # Score legend
     legend_text = "  |  ".join(f"{k} = {v}" for k, v in SCORE_LABEL.items())
     story.append(Paragraph(
         f"<b>Score Legend:</b>  {legend_text}",
@@ -670,7 +869,7 @@ def build_report(df: pd.DataFrame, output_path: str):
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceBefore=14))
     story.append(Paragraph(
         "This report was auto-generated from MoA Innovation Scorer output "
-        "using Gemini for narrative analysis.",
+        "using Gemini for narrative analysis. For internal use only.",
         styles["footer"],
     ))
 
@@ -698,10 +897,7 @@ def upload_to_gcs(local_path: str, drug_names: list) -> list:
         print(f"  Uploading to GCS: {gcs_uri}")
         try:
             blob = bucket.blob(blob_name)
-            blob.upload_from_filename(
-                local_path,
-                content_type="application/pdf",
-            )
+            blob.upload_from_filename(local_path, content_type="application/pdf")
             gcs_uris.append(gcs_uri)
         except Exception as e:
             print(f"  [ERROR] GCS upload failed for '{drug_name}': {e}")
@@ -745,7 +941,9 @@ def generate_moa_report(molecule: str = None, output_path: str = None) -> str:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate MoA Innovation PDF report from BigQuery")
+    parser = argparse.ArgumentParser(
+        description="Generate MoA Innovation business-facing PDF report from BigQuery"
+    )
     parser.add_argument("--output", "-o", default=None, help="Output .pdf path")
     parser.add_argument("--molecule", default=None, help="Filter to a specific molecule")
     args = parser.parse_args()
