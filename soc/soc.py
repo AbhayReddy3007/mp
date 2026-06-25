@@ -25,12 +25,14 @@ MODEL_NAME = "gemini-2.5-flash"
 # ==============================
 # PARSE CLI ARGUMENTS
 # Usage: python code.py DrugA DrugB DrugC ...
-# MOA is prompted interactively for each drug.
+# MOA is fixed as GLP1 for all drugs.
 # ==============================
+DEFAULT_MOA = "GLP1"
+
 def parse_drugs() -> list[dict]:
     """
     Returns [{"name": "Cotadutide", "moa": "GLP1"}, ...]
-    Drug names come from CLI args; MOA is asked interactively per drug.
+    Drug names come from CLI args. MOA is always GLP1.
     """
     if len(sys.argv) > 1:
         drug_names = sys.argv[1:]
@@ -42,17 +44,10 @@ def parse_drugs() -> list[dict]:
             raise SystemExit("❌ No drug names provided. Exiting.")
         drug_names = user_input.split()
 
+    drugs = [{"name": name, "moa": DEFAULT_MOA} for name in drug_names]
+
     print(f"\n💊 Drugs to analyse: {', '.join(drug_names)}")
-    print("📋 Enter the MOA for each drug:\n")
-
-    drugs = []
-    for name in drug_names:
-        moa = input(f"  MOA for {name}: ").strip()
-        if not moa:
-            raise SystemExit(f"❌ No MOA provided for {name}. Exiting.")
-        drugs.append({"name": name, "moa": moa})
-
-    print()
+    print(f"🧬 MOA (all drugs): {DEFAULT_MOA}\n")
     return drugs
 
 # ==============================
