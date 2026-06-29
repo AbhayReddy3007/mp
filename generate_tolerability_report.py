@@ -1,15 +1,35 @@
 """
 generate_tolerability_report.py
-────────────────────────────────
-Reads scored data from BigQuery `tolerability_table` and generates a
-professional PDF report using Gemini for narrative generation.
+───────────────────────────────
+Reads scored data from BigQuery `tolerability_table` and generates one
+professional PDF report **per molecule** using Gemini for narrative generation.
 
-Only the LATEST row per drug (by created_at) is used.
+Only the LATEST row per molecule (by created_at) is used.
+
+The report pulls ALL available fields from BigQuery (discontinuation rates,
+AE profile, SoC comparison, justification, scoring breakdown). If those
+fields are empty or too short, the script automatically calls Gemini with
+Google Search to enrich the data before generating the final narrative.
+
+Report structure (single-molecule, business-facing — max 2 pages):
+  - Executive Summary
+  - Tolerability Profile Overview
+  - Scoring Breakdown & Rationale
+  - Strategic Implications
+  - Scoring reference table (end of document)
 
 Usage:
-    python market_potential/generate_tolerability_report.py
-    python market_potential/generate_tolerability_report.py --molecule Semaglutide
-    python market_potential/generate_tolerability_report.py --output tolerability_report.pdf
+    # All molecules — one PDF each
+    python generate_tolerability_report.py
+
+    # One specific molecule
+    python generate_tolerability_report.py --molecule Semaglutide
+
+    # Two molecules — two separate PDFs
+    python generate_tolerability_report.py --molecule "Semaglutide,Tirzepatide"
+
+    # Custom output directory
+    python generate_tolerability_report.py --outdir ./reports
 """
 
 import os
@@ -36,9 +56,8 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    HRFlowable, PageBreak, KeepTogether
+    HRFlowable, KeepTogether,
 )
-from reportlab.platypus.flowables import HRFlowable
 
 from google import genai as genai_client
 from google.genai import types
@@ -57,21 +76,25 @@ GCS_BUCKET = "cognito-gcs"
 GCS_BASE_PATH = "Cognito_new/reports"
 GCS_FILE_NAME = "Tolerability_Analysis.pdf"
 
-REPORT_TITLE = "Patient Tolerability & Burden Scoring Analysis"
+REPORT_TITLE = "Patient Tolerability & Burden Analysis"
+
+# Minimum character count to consider justification field "sufficient"
+MIN_JUSTIFICATION_LENGTH = 80
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 DARK_BLUE = colors.HexColor("#1F3864")
 LIGHT_BLUE_BG = colors.HexColor("#E8EDF3")
+ACCENT_BLUE = colors.HexColor("#2E5FA3")
 WHITE = colors.white
 LIGHT_GRAY = colors.HexColor("#666666")
-VERY_LIGHT_GRAY = colors.HexColor("#999999")
+DIVIDER_COLOR = colors.HexColor("#D0D7E3")
 
 SCORE_COLORS = {
-    5: colors.HexColor("#008000"),  # Green  – Excellent
-    4: colors.HexColor("#4CAF50"),  # Light green – Good
-    3: colors.HexColor("#CC9900"),  # Amber – Moderate
-    2: colors.HexColor("#E65100"),  # Orange-red – Poor
-    1: colors.HexColor("#CC0000"),  # Red – Very Poor
+    5: colors.HexColor("#008000"),
+    4: colors.HexColor("#4CAF50"),
+    3: colors.HexColor("#CC9900"),
+    2: colors.HexColor("#E65100"),
+    1: colors.HexColor("#CC0000"),
 }
 
 SCORE_LABEL = {
@@ -86,11 +109,15 @@ GUARDRAIL_PASS_COLOR = colors.HexColor("#008000")
 GUARDRAIL_FAIL_COLOR = colors.HexColor("#CC0000")
 
 
-# ── Gemini helper ─────────────────────────────────────────────────────────────
+# ── Gemini helpers ────────────────────────────────────────────────────────────
 
-def call_gemini(prompt: str) -> str:
+def call_gemini(prompt: str, use_search: bool = False) -> str:
+    """Call Gemini with optional Google Search grounding."""
     client = genai_client.Client(api_key=API_KEY)
-    config = types.GenerateContentConfig(temperature=0.3)
+    config_kwargs = {"temperature": 0.3}
+    if use_search:
+        config_kwargs["tools"] = [types.Tool(googleSearch=types.GoogleSearch())]
+    config = types.GenerateContentConfig(**config_kwargs)
     response = client.models.generate_content(model=MODEL, contents=prompt, config=config)
     return response.text.strip() if response.text else ""
 
@@ -120,13 +147,17 @@ def _bq_client():
     return bigquery.Client(project=BQ_PROJECT_ID, credentials=credentials, location=BQ_LOCATION)
 
 
-def load_from_bigquery(molecule: str = None) -> pd.DataFrame:
-    """Load LATEST row per drug from tolerability_table."""
+def load_from_bigquery(molecules: list[str] | None = None) -> pd.DataFrame:
+    """
+    Load the LATEST row per molecule from tolerability_table.
+    If `molecules` is provided, only those molecules are fetched.
+    """
     client = _bq_client()
 
     molecule_filter = ""
-    if molecule:
-        molecule_filter = f"AND molecule_name = '{molecule}'"
+    if molecules:
+        escaped = ", ".join(f"'{m.strip()}'" for m in molecules)
+        molecule_filter = f"AND molecule_name IN ({escaped})"
 
     query = f"""
     WITH ranked AS (
@@ -140,110 +171,329 @@ def load_from_bigquery(molecule: str = None) -> pd.DataFrame:
     """
     print(f"Loading latest tolerability data from {BQ_TABLE}...")
     df = client.query(query).to_dataframe()
-    print(f"  Loaded {len(df)} drug(s).")
+    print(f"  Loaded {len(df)} molecule(s).")
     return df
 
 
-# ── Statistics ────────────────────────────────────────────────────────────────
+# ── Single-molecule statistics ────────────────────────────────────────────────
 
-def compute_statistics(df: pd.DataFrame) -> dict:
-    stats = {
-        "total_drugs": len(df),
-        "drugs": [],
-        "avg_score": None,
-        "score_distribution": {},
-        "guardrail_pass": 0,
-        "guardrail_fail": 0,
-        "per_drug_stats": {},
+def extract_molecule_stats(row: pd.Series) -> dict:
+    """Extract ALL relevant fields for a single molecule row."""
+    def safe(val, fallback="N/A"):
+        return str(val).strip() if pd.notna(val) and str(val).strip() else fallback
+
+    score_raw = row.get("score_numeric")
+    score_int = None
+    try:
+        score_int = int(float(score_raw))
+    except (ValueError, TypeError):
+        pass
+
+    base_score_raw = row.get("base_score")
+    base_score_int = None
+    try:
+        base_score_int = int(float(base_score_raw))
+    except (ValueError, TypeError):
+        pass
+
+    soc_adj_raw = row.get("soc_adjustment")
+    soc_adj_int = None
+    try:
+        soc_adj_int = int(float(soc_adj_raw))
+    except (ValueError, TypeError):
+        pass
+
+    burden_adj_raw = row.get("burden_adjustment")
+    burden_adj_int = None
+    try:
+        burden_adj_int = int(float(burden_adj_raw))
+    except (ValueError, TypeError):
+        pass
+
+    trials_used_raw = row.get("trials_used")
+    trials_used_int = None
+    try:
+        trials_used_int = int(float(trials_used_raw))
+    except (ValueError, TypeError):
+        pass
+
+    total_trials_raw = row.get("total_trials_extracted")
+    total_trials_int = None
+    try:
+        total_trials_int = int(float(total_trials_raw))
+    except (ValueError, TypeError):
+        pass
+
+    return {
+        "molecule_name": safe(row.get("molecule_name")),
+        "tolerability_score": safe(row.get("tolerability_score")),
+        "score_int": score_int,
+        "score_label": SCORE_LABEL.get(score_int, "N/A") if score_int else "N/A",
+        # Supporting data
+        "discontinuation_rate_drug": safe(row.get("discontinuation_rate_drug")),
+        "discontinuation_rate_soc": safe(row.get("discontinuation_rate_soc")),
+        "soc_source": safe(row.get("soc_source")),
+        "difference": safe(row.get("difference")),
+        # Side effect profile
+        "key_aes": safe(row.get("key_aes")),
+        "ae_frequency": safe(row.get("ae_frequency")),
+        "ae_severity": safe(row.get("ae_severity")),
+        # Comparisons
+        "vs_placebo": safe(row.get("vs_placebo")),
+        "vs_soc": safe(row.get("vs_soc")),
+        # Guardrail
+        "guardrail": safe(row.get("guardrail")),
+        "guardrail_reason": safe(row.get("guardrail_reason"), ""),
+        # Justification (full text)
+        "justification": safe(row.get("justification"), ""),
+        # Scoring breakdown
+        "base_score": base_score_int,
+        "soc_adjustment": soc_adj_int,
+        "burden_adjustment": burden_adj_int,
+        "trials_used": trials_used_int,
+        "total_trials_extracted": total_trials_int,
     }
-    if df.empty:
+
+
+# ── Data enrichment (fetch more info if BQ data is thin) ─────────────────────
+
+def _is_data_sufficient(stats: dict) -> bool:
+    """Check whether the BQ justification and AE fields have enough substance."""
+    justification_ok = len(stats.get("justification", "")) >= MIN_JUSTIFICATION_LENGTH
+    has_aes = len(stats.get("key_aes", "")) > 5 and stats.get("key_aes") != "N/A"
+    has_disc_rate = stats.get("discontinuation_rate_drug") not in ("N/A", "")
+    return justification_ok and has_aes and has_disc_rate
+
+
+def enrich_molecule_data(stats: dict) -> dict:
+    """If BQ data is insufficient, call Gemini with Google Search to fetch
+    additional tolerability information for the molecule."""
+    if _is_data_sufficient(stats):
+        print(f"  BQ data is sufficient for {stats['molecule_name']} — skipping enrichment.")
         return stats
 
-    stats["drugs"] = df["molecule_name"].dropna().unique().tolist()
+    print(f"  BQ data is thin for {stats['molecule_name']} — enriching via Gemini + Google Search...")
 
-    if "score_numeric" in df.columns:
-        numeric = pd.to_numeric(df["score_numeric"], errors="coerce").dropna()
-        if len(numeric):
-            stats["avg_score"] = float(round(numeric.mean(), 2))
-            for s in range(1, 6):
-                stats["score_distribution"][s] = int((numeric == s).sum())
+    prompt = f"""You are a pharmaceutical research analyst. Research the tolerability and safety profile
+of the following drug thoroughly using the latest clinical trial data, FDA labels, and medical literature.
 
-    if "guardrail" in df.columns:
-        stats["guardrail_pass"] = int((df["guardrail"] == "PASS").sum())
-        stats["guardrail_fail"] = int((df["guardrail"] == "FAIL").sum())
+Drug: {stats['molecule_name']}
+Known Discontinuation Rate (Drug): {stats['discontinuation_rate_drug']}
+Known Discontinuation Rate (SoC): {stats['discontinuation_rate_soc']}
+Known Key AEs: {stats['key_aes']}
 
-    for _, row in df.iterrows():
-        drug = str(row.get("molecule_name", ""))
-        stats["per_drug_stats"][drug] = {
-            "score": row.get("score_numeric"),
-            "tolerability_score": str(row.get("tolerability_score", "N/A")),
-            "guardrail": str(row.get("guardrail", "N/A")),
-            "discontinuation_rate_drug": str(row.get("discontinuation_rate_drug", "N/A")),
-            "discontinuation_rate_soc": str(row.get("discontinuation_rate_soc", "N/A")),
-            "key_aes": str(row.get("key_aes", "N/A")),
-            "severity": str(row.get("severity", "N/A")),
-            "vs_soc": str(row.get("vs_soc", "N/A")),
-        }
+Provide a comprehensive tolerability analysis. Return ONLY a valid JSON object:
+{{
+    "discontinuation_rate_drug": "X.X% (from which source/trial)",
+    "discontinuation_rate_soc": "X.X% (SoC drug name)",
+    "key_aes": "Top 5 adverse events with frequencies, e.g. Nausea (44%), Diarrhea (30%)",
+    "ae_severity": "Mild/Moderate/Severe/Mixed — overall severity classification",
+    "ae_persistence": "Transient/Persistent/Mixed — do AEs diminish over time?",
+    "vs_placebo_detail": "2-3 sentences comparing drug tolerability vs placebo from pivotal trials",
+    "vs_soc_detail": "2-3 sentences comparing drug tolerability vs standard of care",
+    "management_burden": "What additional interventions patients need (dose titration, antiemetics, monitoring)",
+    "clinical_trial_sources": "Key trial names/IDs used (e.g. SUSTAIN, PIONEER, SURPASS)",
+    "tolerability_narrative": "4-6 sentence comprehensive tolerability summary covering discontinuation, AEs, persistence, and patient burden"
+}}"""
+
+    try:
+        text = call_gemini(prompt, use_search=True)
+        enrichment = _extract_json(text)
+        if enrichment:
+            enriched = dict(stats)
+            # Only fill fields that are currently empty/thin
+            if stats.get("discontinuation_rate_drug") in ("N/A", "") and enrichment.get("discontinuation_rate_drug"):
+                enriched["discontinuation_rate_drug"] = enrichment["discontinuation_rate_drug"]
+            if stats.get("discontinuation_rate_soc") in ("N/A", "") and enrichment.get("discontinuation_rate_soc"):
+                enriched["discontinuation_rate_soc"] = enrichment["discontinuation_rate_soc"]
+            if (stats.get("key_aes") in ("N/A", "") or len(stats.get("key_aes", "")) < 10) and enrichment.get("key_aes"):
+                enriched["key_aes"] = enrichment["key_aes"]
+            if stats.get("ae_severity") in ("N/A", "") and enrichment.get("ae_severity"):
+                enriched["ae_severity"] = enrichment["ae_severity"]
+            if len(stats.get("justification", "")) < MIN_JUSTIFICATION_LENGTH and enrichment.get("tolerability_narrative"):
+                enriched["justification"] = enrichment["tolerability_narrative"]
+
+            # Store enrichment extras for the narrative prompt
+            enriched["_enrichment"] = enrichment
+            print(f"  Enrichment complete for {stats['molecule_name']}")
+            return enriched
+    except Exception as e:
+        print(f"  [WARN] Enrichment failed for {stats['molecule_name']}: {e}")
 
     return stats
 
 
-# ── LLM narrative ─────────────────────────────────────────────────────────────
+# ── LLM narrative (single molecule) ──────────────────────────────────────────
 
-def generate_executive_summary(stats: dict, df: pd.DataFrame) -> dict:
-    drug_rows = []
-    for _, r in df.iterrows():
-        drug_rows.append({
-            "drug": str(r.get("molecule_name", "")),
-            "score": r.get("score_numeric"),
-            "tolerability_score": str(r.get("tolerability_score", "")),
-            "guardrail": str(r.get("guardrail", "")),
-            "discontinuation_rate_drug": str(r.get("discontinuation_rate_drug", "")),
-            "discontinuation_rate_soc": str(r.get("discontinuation_rate_soc", "")),
-            "key_aes": str(r.get("key_aes", ""))[:200],
-            "severity": str(r.get("severity", "")),
-            "vs_placebo": str(r.get("vs_placebo", "")),
-            "vs_soc": str(r.get("vs_soc", "")),
-            "justification": str(r.get("justification", ""))[:400],
-        })
+def generate_tolerability_narrative(stats: dict) -> dict:
+    """
+    Generate a business-focused tolerability report narrative for Medical Affairs.
 
-    prompt = f"""You are a senior pharmaceutical analyst writing a Patient Tolerability & Burden report.
-Based on the data below, produce a thorough analytical report. Be specific — reference
-drug names, scores, discontinuation rates, and adverse event profiles.
+    Returns a dict with: key_findings, insights_implications, profile_summary.
+    """
+    # Build comprehensive data block from all available fields
+    data_parts = []
+    data_parts.append(f"Molecule: {stats['molecule_name']}")
+    data_parts.append(f"Tolerability Score: {stats['tolerability_score']} ({stats['score_label']})")
+    data_parts.append(f"Guardrail: {stats['guardrail']}")
+    if stats.get("guardrail_reason"):
+        data_parts.append(f"Guardrail Reason: {stats['guardrail_reason']}")
+    data_parts.append(f"Discontinuation Rate (Drug): {stats['discontinuation_rate_drug']}")
+    data_parts.append(f"Discontinuation Rate (SoC): {stats['discontinuation_rate_soc']}")
+    data_parts.append(f"Difference vs SoC: {stats['difference']}")
+    data_parts.append(f"SoC Source: {stats['soc_source']}")
+    data_parts.append(f"Key Adverse Events: {stats['key_aes']}")
+    data_parts.append(f"AE Frequency: {stats['ae_frequency']}")
+    data_parts.append(f"AE Severity: {stats['ae_severity']}")
+    data_parts.append(f"vs Placebo: {stats['vs_placebo']}")
+    data_parts.append(f"vs SoC: {stats['vs_soc']}")
 
-PORTFOLIO STATISTICS:
-- Total drugs assessed: {stats['total_drugs']}
-- Drugs: {', '.join(stats['drugs'])}
-- Average tolerability score: {stats['avg_score']} (1=Very Poor, 5=Excellent)
-- Score distribution: {json.dumps(stats['score_distribution'])}
-- Guardrail: {stats['guardrail_pass']} PASS, {stats['guardrail_fail']} FAIL
+    scoring_parts = []
+    if stats.get("base_score") is not None:
+        scoring_parts.append(f"Base Score: {stats['base_score']}/5")
+    if stats.get("soc_adjustment") is not None:
+        scoring_parts.append(f"SoC Adjustment: {stats['soc_adjustment']:+d}")
+    if stats.get("burden_adjustment") is not None:
+        scoring_parts.append(f"Burden Adjustment: {stats['burden_adjustment']:+d}")
+    if stats.get("trials_used") is not None:
+        scoring_parts.append(f"Trials Used for Scoring: {stats['trials_used']}")
+    if stats.get("total_trials_extracted") is not None:
+        scoring_parts.append(f"Total Trials Extracted: {stats['total_trials_extracted']}")
 
-DRUG-LEVEL DATA (JSON):
-{json.dumps(drug_rows, indent=1)}
+    justification_block = stats.get("justification", "")
 
-Respond ONLY with a valid JSON object (no markdown fences):
+    # Include enrichment data if available
+    enrichment = stats.get("_enrichment", {})
+    enrichment_block = ""
+    if enrichment:
+        enrich_parts = []
+        for k in ["vs_placebo_detail", "vs_soc_detail", "management_burden", "clinical_trial_sources", "tolerability_narrative", "ae_persistence"]:
+            val = enrichment.get(k, "")
+            if val:
+                enrich_parts.append(f"{k.replace('_', ' ').title()}: {val}")
+        if enrich_parts:
+            enrichment_block = "\n".join(enrich_parts)
+
+    prompt = f"""You are a business-focused medical insights analyst.
+
+Goal: Create a concise, 2-page tolerability report for {stats['molecule_name']} highlighting
+key findings and insights derived from the provided data outputs. The report is intended for
+a Medical Affairs business audience.
+
+Context: The data comes from structured outputs containing tolerability-related information
+(discontinuation rates, adverse events, severity, patient burden, comparison with standard
+of care, etc.). The audience is non-technical and not familiar with internal analytical
+frameworks, scoring methodologies, or internal jargon.
+
+Source: Use only the provided data outputs as the source of truth. Focus specifically on
+tolerability-related data points. Do not introduce external assumptions unless clearly
+derived from the data.
+
+=== PROVIDED DATA ===
+{chr(10).join(data_parts)}
+
+SCORING CONTEXT (for your reference only — do NOT expose methodology):
+{chr(10).join(scoring_parts) if scoring_parts else 'Not available'}
+
+DETAILED ANALYSIS:
+{justification_block if justification_block else 'Not available'}
+
+ADDITIONAL RESEARCH DATA:
+{enrichment_block if enrichment_block else 'Not available'}
+
+=== INSTRUCTIONS ===
+
+1. Start with a section: "Key Tolerability Findings for {stats['molecule_name']}"
+   - Summarize the most important observations related to tolerability
+   - Highlight:
+     - Discontinuation rates in comparison to placebo and standard of care
+     - Key adverse events observed
+     - Frequency and severity of side effects
+     - Any notable differences versus comparator treatments
+   - Focus on what the data shows, not how it was calculated
+
+2. Follow with: "Insights and Implications"
+   - Translate tolerability findings into business-relevant insights
+   - Highlight:
+     - Overall patient experience and burden
+     - Key drivers of discontinuation (if identifiable)
+     - Strengths or concerns compared to standard treatments
+     - Potential impact on adoption, adherence, or positioning
+   - Keep insights simple, clear, and actionable
+
+3. Include: "Tolerability Profile Summary"
+   - Provide a high-level summary of how well the molecule is tolerated overall
+   - Comment on consistency of tolerability across studies if available
+   - Briefly mention the overall tolerability score in simple terms without explaining
+     scoring methodology
+
+Language and Style:
+- Do NOT use internal jargon, scoring framework names, or technical modeling terms
+- Avoid methodological explanations (e.g., how score was derived, base scores, adjustments)
+- Use clear, simple, business-friendly language
+- Translate clinical findings into plain-language impact (e.g., what side effects mean
+  for patients and treatment continuation)
+
+Tone: Professional, objective, and insight-driven. Focus on clarity, relevance, and
+business impact.
+
+Respond ONLY with a valid JSON object (no markdown fences, no extra text):
 {{
-  "executive_summary": "<5-8 sentences overview of the tolerability landscape across the assessed drugs>",
-  "key_findings": ["<finding 1 with drug names and scores>", "<finding 2>", "<finding 3>", "<finding 4>"],
-  "discontinuation_analysis": "<4-6 sentences analysing discontinuation rates — which drugs perform better or worse vs SoC and placebo>",
-  "risk_highlights": "<3-5 sentences on drugs with low scores, FAIL guardrails, or high discontinuation rates>",
-  "strength_highlights": "<3-5 sentences on drugs with high scores and favourable tolerability profiles>",
-  "per_drug_narratives": {{
-    "<drug_name>": "<3-5 sentence analysis of this drug's tolerability profile, discontinuation rate vs SoC, AE burden, and strategic implications>"
+  "key_findings": {{
+    "summary_bullets": [
+      "Key finding 1 about discontinuation rates vs placebo and standard of care",
+      "Key finding 2 about the most common adverse events and their frequency",
+      "Key finding 3 about severity of side effects and patient experience",
+      "Key finding 4 about notable differences vs comparator treatments",
+      "Key finding 5 about any other important tolerability observations"
+    ],
+    "discontinuation_detail": "2-3 sentences in plain language about what the discontinuation rates mean — how many patients stopped treatment due to side effects compared to placebo and standard of care",
+    "adverse_event_detail": "2-3 sentences describing the most common side effects, how often they occur, and whether they are mild/moderate/severe",
+    "comparator_detail": "2-3 sentences on how this drug's tolerability compares to existing treatments in plain business terms"
+  }},
+  "insights_implications": {{
+    "patient_experience": "2-3 sentences on overall patient experience — what does the side effect profile mean for patients day-to-day",
+    "discontinuation_drivers": "2-3 sentences on what appears to drive patients to stop treatment, if identifiable from the data",
+    "strengths_concerns": "2-3 sentences on key tolerability strengths or red flags compared to standard treatments",
+    "adoption_impact": "2-3 sentences on how this tolerability profile could affect real-world adoption, patient adherence, and market positioning"
+  }},
+  "profile_summary": {{
+    "overall_assessment": "3-4 sentences providing a high-level summary of how well tolerated this molecule is overall, written for a business audience",
+    "cross_study_consistency": "1-2 sentences commenting on whether tolerability findings are consistent across available studies",
+    "score_context": "1-2 sentences briefly mentioning the tolerability score in simple terms (e.g., 'The molecule received a favorable/moderate/concerning tolerability rating') WITHOUT explaining how the score was calculated"
   }}
-}}
-"""
+}}"""
+
     text = call_gemini(prompt)
     result = _extract_json(text)
     if result:
         return result
+
+    # Fallback
     return {
-        "executive_summary": "Analysis complete. See tables below for details.",
-        "key_findings": ["See detailed tables."],
-        "discontinuation_analysis": "See discontinuation rate table.",
-        "risk_highlights": "Refer to score tables.",
-        "strength_highlights": "Refer to score tables.",
-        "per_drug_narratives": {},
+        "key_findings": {
+            "summary_bullets": [
+                f"Discontinuation rate (drug): {stats['discontinuation_rate_drug']}.",
+                f"Discontinuation rate (SoC): {stats['discontinuation_rate_soc']}. Difference: {stats['difference']}.",
+                f"Key adverse events reported: {stats['key_aes']}.",
+                f"AE severity: {stats['ae_severity']}. vs Placebo: {stats['vs_placebo']}.",
+                f"Guardrail status: {stats['guardrail']}.",
+            ],
+            "discontinuation_detail": stats.get("justification") or "See detailed analysis.",
+            "adverse_event_detail": f"Key AEs: {stats['key_aes']}. Severity: {stats['ae_severity']}.",
+            "comparator_detail": f"vs SoC: {stats['vs_soc']}. vs Placebo: {stats['vs_placebo']}.",
+        },
+        "insights_implications": {
+            "patient_experience": "See detailed analysis.",
+            "discontinuation_drivers": "See detailed analysis.",
+            "strengths_concerns": "See detailed analysis.",
+            "adoption_impact": "See detailed analysis.",
+        },
+        "profile_summary": {
+            "overall_assessment": f"{stats['molecule_name']} received a tolerability score of {stats['tolerability_score']} ({stats['score_label']}).",
+            "cross_study_consistency": "Data consistency is based on available clinical trial evidence.",
+            "score_context": f"The molecule received a {stats['score_label'].lower()} tolerability rating.",
+        },
     }
 
 
@@ -251,405 +501,278 @@ Respond ONLY with a valid JSON object (no markdown fences):
 
 def build_styles():
     base = getSampleStyleSheet()
-
-    styles = {
+    return {
         "title": ParagraphStyle(
-            "ReportTitle",
-            parent=base["Normal"],
-            fontSize=20,
-            leading=24,
-            textColor=DARK_BLUE,
-            alignment=TA_CENTER,
-            fontName="Helvetica-Bold",
-            spaceAfter=4,
+            "ReportTitle", parent=base["Normal"],
+            fontSize=20, leading=26, textColor=DARK_BLUE,
+            alignment=TA_CENTER, fontName="Helvetica-Bold", spaceAfter=2,
+        ),
+        "molecule_name_title": ParagraphStyle(
+            "MoleculeNameTitle", parent=base["Normal"],
+            fontSize=14, leading=18, textColor=ACCENT_BLUE,
+            alignment=TA_CENTER, fontName="Helvetica-Bold", spaceAfter=4,
         ),
         "subtitle": ParagraphStyle(
-            "ReportSubtitle",
-            parent=base["Normal"],
-            fontSize=9,
-            leading=12,
-            textColor=LIGHT_GRAY,
-            alignment=TA_CENTER,
-            fontName="Helvetica",
-            spaceAfter=12,
+            "ReportSubtitle", parent=base["Normal"],
+            fontSize=9, leading=12, textColor=LIGHT_GRAY,
+            alignment=TA_CENTER, fontName="Helvetica", spaceAfter=12,
         ),
         "h2": ParagraphStyle(
-            "H2",
-            parent=base["Normal"],
-            fontSize=13,
-            leading=16,
-            textColor=DARK_BLUE,
-            fontName="Helvetica-Bold",
-            spaceBefore=14,
-            spaceAfter=6,
+            "H2", parent=base["Normal"],
+            fontSize=13, leading=16, textColor=DARK_BLUE,
+            fontName="Helvetica-Bold", spaceBefore=14, spaceAfter=6,
         ),
         "h3": ParagraphStyle(
-            "H3",
-            parent=base["Normal"],
-            fontSize=11,
-            leading=14,
-            textColor=DARK_BLUE,
-            fontName="Helvetica-Bold",
-            spaceBefore=10,
-            spaceAfter=4,
+            "H3", parent=base["Normal"],
+            fontSize=11, leading=14, textColor=DARK_BLUE,
+            fontName="Helvetica-Bold", spaceBefore=10, spaceAfter=4,
         ),
         "body": ParagraphStyle(
-            "Body",
-            parent=base["Normal"],
-            fontSize=10,
-            leading=14,
-            textColor=colors.HexColor("#333333"),
-            fontName="Helvetica",
-            spaceAfter=4,
-            alignment=TA_JUSTIFY,
+            "Body", parent=base["Normal"],
+            fontSize=10, leading=14, textColor=colors.HexColor("#333333"),
+            fontName="Helvetica", spaceAfter=4, alignment=TA_JUSTIFY,
         ),
         "bullet": ParagraphStyle(
-            "Bullet",
-            parent=base["Normal"],
-            fontSize=10,
-            leading=14,
-            textColor=colors.HexColor("#333333"),
-            fontName="Helvetica",
-            spaceAfter=3,
-            leftIndent=16,
-            bulletIndent=4,
+            "Bullet", parent=base["Normal"],
+            fontSize=9, leading=13, textColor=colors.HexColor("#333333"),
+            fontName="Helvetica", spaceAfter=3, leftIndent=18,
+            bulletIndent=6,
         ),
-        "stat": ParagraphStyle(
-            "Stat",
-            parent=base["Normal"],
-            fontSize=9,
-            leading=12,
-            textColor=LIGHT_GRAY,
-            fontName="Helvetica-Oblique",
-            spaceAfter=4,
+        "methodology_note": ParagraphStyle(
+            "MethodologyNote", parent=base["Normal"],
+            fontSize=8, leading=12, textColor=colors.HexColor("#333333"),
+            fontName="Helvetica", spaceAfter=4, alignment=TA_JUSTIFY,
         ),
         "footer": ParagraphStyle(
-            "Footer",
-            parent=base["Normal"],
-            fontSize=7,
-            leading=10,
-            textColor=colors.HexColor("#999999"),
-            fontName="Helvetica-Oblique",
-            alignment=TA_CENTER,
-            spaceBefore=10,
+            "Footer", parent=base["Normal"],
+            fontSize=7, leading=10, textColor=colors.HexColor("#999999"),
+            fontName="Helvetica", alignment=TA_CENTER, spaceBefore=10,
         ),
         "cell": ParagraphStyle(
-            "Cell",
-            parent=base["Normal"],
-            fontSize=8,
-            leading=11,
-            textColor=colors.HexColor("#333333"),
-            fontName="Helvetica",
-            alignment=TA_CENTER,
+            "Cell", parent=base["Normal"],
+            fontSize=8, leading=11, textColor=colors.HexColor("#333333"),
+            fontName="Helvetica", alignment=TA_CENTER,
         ),
         "cell_header": ParagraphStyle(
-            "CellHeader",
-            parent=base["Normal"],
-            fontSize=8,
-            leading=11,
-            textColor=WHITE,
-            fontName="Helvetica-Bold",
-            alignment=TA_CENTER,
+            "CellHeader", parent=base["Normal"],
+            fontSize=8, leading=11, textColor=WHITE,
+            fontName="Helvetica-Bold", alignment=TA_CENTER,
         ),
-        "cell_label": ParagraphStyle(
-            "CellLabel",
-            parent=base["Normal"],
-            fontSize=9,
-            leading=12,
-            textColor=colors.HexColor("#333333"),
-            fontName="Helvetica-Bold",
-        ),
-        "cell_value": ParagraphStyle(
-            "CellValue",
-            parent=base["Normal"],
-            fontSize=9,
-            leading=12,
-            textColor=colors.HexColor("#333333"),
-            fontName="Helvetica",
+        "section_label": ParagraphStyle(
+            "SectionLabel", parent=base["Normal"],
+            fontSize=10, leading=13, textColor=DARK_BLUE,
+            fontName="Helvetica-Bold", spaceAfter=2, leftIndent=6,
         ),
     }
-    return styles
 
 
 def _score_color(score_val):
     try:
-        s = int(float(score_val))
-        return SCORE_COLORS.get(s, colors.black)
+        return SCORE_COLORS.get(int(float(score_val)), colors.black)
     except (ValueError, TypeError):
         return colors.black
 
 
-# ── Report builder ────────────────────────────────────────────────────────────
+def _render_bullets(items: list, styles: dict, story: list):
+    """Render a list of strings as bullet points."""
+    for item in items:
+        if item and str(item).strip():
+            story.append(Paragraph(
+                f"&#8226; {item}",
+                styles["bullet"],
+            ))
 
-def build_report(df: pd.DataFrame, output_path: str):
-    if df.empty:
-        print("ERROR: No tolerability data to report.")
-        return
 
-    stats = compute_statistics(df)
+def _scoring_framework_table(styles: dict) -> Table:
+    """Render the Tolerability scoring reference table."""
+    framework = [
+        ("5", "Excellent", "Discontinuation rate at or below placebo; mild, transient AEs; no management needed"),
+        ("4", "Good", "Discontinuation rate above placebo but below 5%; better than SoC"),
+        ("3", "Moderate", "Discontinuation rate 5-10%; similar to SoC; manageable side effects"),
+        ("2", "Poor", "Discontinuation rate 10-20%; worse than SoC; persistent or moderate AEs"),
+        ("1", "Very Poor", "Discontinuation rate 20%+; severe or management-requiring AEs"),
+    ]
+    header = [
+        Paragraph("Score", styles["cell_header"]),
+        Paragraph("Label", styles["cell_header"]),
+        Paragraph("Description", styles["cell_header"]),
+    ]
+    rows = [header]
+    for sc, lbl, desc in framework:
+        rows.append([
+            Paragraph(sc,   ParagraphStyle("FWScore", parent=styles["cell"], fontName="Helvetica")),
+            Paragraph(lbl,  ParagraphStyle("FWLabel", parent=styles["cell"], fontName="Helvetica")),
+            Paragraph(desc, ParagraphStyle("FWDesc",  parent=styles["cell"], alignment=TA_LEFT)),
+        ])
 
-    print("Generating narrative with Gemini...")
-    narrative = generate_executive_summary(stats, df)
+    tbl = Table(rows, colWidths=[0.5 * inch, 1.2 * inch, 5.0 * inch])
+    row_bgs = [
+        ("BACKGROUND", (0, i), (-1, i), LIGHT_BLUE_BG if i % 2 == 0 else WHITE)
+        for i in range(1, len(rows))
+    ]
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), DARK_BLUE),
+        ("GRID",       (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
+        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN",      (0, 0), (1, -1), "CENTER"),
+        ("ALIGN",      (2, 1), (2, -1), "LEFT"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
+        *row_bgs,
+    ]))
+    return tbl
 
+
+# ── Single-molecule report builder ────────────────────────────────────────────
+
+def build_single_molecule_report(stats: dict, narrative: dict, output_path: str):
+    """Build and save a business-focused PDF report for one molecule."""
     styles = build_styles()
     story = []
 
     doc = SimpleDocTemplate(
         output_path,
         pagesize=letter,
-        topMargin=0.8 * inch,
+        topMargin=0.75 * inch,
         bottomMargin=0.6 * inch,
         leftMargin=0.9 * inch,
         rightMargin=0.9 * inch,
-        title=REPORT_TITLE,
+        title=f"{REPORT_TITLE} — {stats['molecule_name']}",
         author="Tolerability Scorer",
     )
 
-    # ── Title ─────────────────────────────────────────────────────────────────
+    # ── Title block ───────────────────────────────────────────────────────────
     story.append(Paragraph(REPORT_TITLE, styles["title"]))
+    story.append(Paragraph(stats["molecule_name"], styles["molecule_name_title"]))
     story.append(Paragraph(
-        f"Generated {datetime.now().strftime('%B %d, %Y')}  •  "
-        f"{stats['total_drugs']} Drug(s) Assessed",
+        f"Generated {datetime.now().strftime('%B %d, %Y')}",
         styles["subtitle"],
     ))
     story.append(HRFlowable(width="100%", thickness=2, color=DARK_BLUE, spaceAfter=12))
 
-    # ── Executive Summary ─────────────────────────────────────────────────────
-    story.append(Paragraph("Executive Summary", styles["h2"]))
-    story.append(Paragraph(narrative.get("executive_summary", ""), styles["body"]))
+    # ══════════════════════════════════════════════════════════════════════
+    # Key Tolerability Findings
+    # ══════════════════════════════════════════════════════════════════════
+    story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
+    story.append(Paragraph(
+        f"Key Tolerability Findings for {stats['molecule_name']}", styles["h2"]
+    ))
+
+    key_findings = narrative.get("key_findings", {})
+    if isinstance(key_findings, dict):
+        # Bullet summary
+        bullets = key_findings.get("summary_bullets", [])
+        if isinstance(bullets, list):
+            _render_bullets(bullets, styles, story)
+        story.append(Spacer(1, 6))
+
+        disc_detail = key_findings.get("discontinuation_detail", "")
+        if disc_detail:
+            story.append(Paragraph("<b>Discontinuation Rates:</b>", styles["section_label"]))
+            story.append(Paragraph(disc_detail, styles["body"]))
+            story.append(Spacer(1, 4))
+
+        ae_detail = key_findings.get("adverse_event_detail", "")
+        if ae_detail:
+            story.append(Paragraph("<b>Adverse Events:</b>", styles["section_label"]))
+            story.append(Paragraph(ae_detail, styles["body"]))
+            story.append(Spacer(1, 4))
+
+        comparator_detail = key_findings.get("comparator_detail", "")
+        if comparator_detail:
+            story.append(Paragraph("<b>Comparator Analysis:</b>", styles["section_label"]))
+            story.append(Paragraph(comparator_detail, styles["body"]))
+    elif isinstance(key_findings, str):
+        story.append(Paragraph(key_findings, styles["body"]))
     story.append(Spacer(1, 6))
 
-    # ── Portfolio Overview ────────────────────────────────────────────────────
-    story.append(Paragraph("Portfolio Overview", styles["h2"]))
+    # ══════════════════════════════════════════════════════════════════════
+    # Insights and Implications
+    # ══════════════════════════════════════════════════════════════════════
+    story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
+    story.append(Paragraph("Insights and Implications", styles["h2"]))
 
-    dist_parts = [
-        f"{SCORE_LABEL[s]}: {stats['score_distribution'].get(s, 0)}"
-        for s in [5, 4, 3, 2, 1]
-        if stats["score_distribution"].get(s, 0) > 0
-    ]
+    insights = narrative.get("insights_implications", {})
+    if isinstance(insights, dict):
+        patient_exp = insights.get("patient_experience", "")
+        if patient_exp:
+            story.append(Paragraph(f"<b>Patient Experience:</b> {patient_exp}", styles["body"]))
+            story.append(Spacer(1, 4))
 
-    overview_data = [
-        [Paragraph("Total Drugs Assessed", styles["cell_label"]),
-         Paragraph(str(stats["total_drugs"]), styles["cell_value"])],
-        [Paragraph("Drugs Covered", styles["cell_label"]),
-         Paragraph(", ".join(stats["drugs"]), styles["cell_value"])],
-        [Paragraph("Average Tolerability Score", styles["cell_label"]),
-         Paragraph(f"{stats['avg_score']} / 5" if stats["avg_score"] else "N/A", styles["cell_value"])],
-        [Paragraph("Guardrail Summary", styles["cell_label"]),
-         Paragraph(f"{stats['guardrail_pass']} PASS  |  {stats['guardrail_fail']} FAIL", styles["cell_value"])],
-    ]
-    if dist_parts:
-        overview_data.append([
-            Paragraph("Score Distribution", styles["cell_label"]),
-            Paragraph(";  ".join(dist_parts), styles["cell_value"]),
-        ])
+        disc_drivers = insights.get("discontinuation_drivers", "")
+        if disc_drivers:
+            story.append(Paragraph(f"<b>Drivers of Discontinuation:</b> {disc_drivers}", styles["body"]))
+            story.append(Spacer(1, 4))
 
-    ov_table = Table(overview_data, colWidths=[2.5 * inch, 4.2 * inch])
-    ov_table.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-        ("BACKGROUND", (0, 0), (0, -1), LIGHT_BLUE_BG),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-    ]))
-    story.append(ov_table)
-    story.append(Spacer(1, 12))
+        strengths = insights.get("strengths_concerns", "")
+        if strengths:
+            story.append(Paragraph(f"<b>Strengths &amp; Concerns:</b> {strengths}", styles["body"]))
+            story.append(Spacer(1, 4))
 
-    # ── Key Findings ──────────────────────────────────────────────────────────
-    story.append(Paragraph("Key Findings", styles["h2"]))
-    for finding in narrative.get("key_findings", []):
-        story.append(Paragraph(f"• {finding}", styles["bullet"]))
+        adoption = insights.get("adoption_impact", "")
+        if adoption:
+            story.append(Paragraph(f"<b>Impact on Adoption &amp; Positioning:</b> {adoption}", styles["body"]))
+    elif isinstance(insights, str):
+        story.append(Paragraph(insights, styles["body"]))
+    story.append(Spacer(1, 6))
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Tolerability Profile Summary
+    # ══════════════════════════════════════════════════════════════════════
+    story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
+    story.append(Paragraph("Tolerability Profile Summary", styles["h2"]))
+
+    profile_summary = narrative.get("profile_summary", {})
+    if isinstance(profile_summary, dict):
+        overall = profile_summary.get("overall_assessment", "")
+        if overall:
+            story.append(Paragraph(overall, styles["body"]))
+            story.append(Spacer(1, 4))
+
+        consistency = profile_summary.get("cross_study_consistency", "")
+        if consistency:
+            story.append(Paragraph(consistency, styles["body"]))
+            story.append(Spacer(1, 4))
+
+        score_ctx = profile_summary.get("score_context", "")
+        if score_ctx:
+            story.append(Paragraph(score_ctx, styles["body"]))
+    elif isinstance(profile_summary, str):
+        story.append(Paragraph(profile_summary, styles["body"]))
     story.append(Spacer(1, 8))
 
-    # ── Tolerability Score Summary Table ──────────────────────────────────────
-    story.append(Paragraph("Tolerability Score Summary", styles["h2"]))
+    # ── Scoring reference table ───────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
+    story.append(Paragraph("Tolerability Scoring Reference", styles["h2"]))
+    story.append(_scoring_framework_table(styles))
+    story.append(Spacer(1, 8))
 
-    display_cols = ["Drug", "Score", "Discontinuation (Drug)", "Discontinuation (SoC)", "vs SoC", "Key AEs", "Severity", "Guardrail"]
-    data_cols    = ["molecule_name", "score_numeric", "discontinuation_rate_drug", "discontinuation_rate_soc", "vs_soc", "key_aes", "severity", "guardrail"]
-    col_widths   = [1.1 * inch, 0.55 * inch, 1.1 * inch, 1.0 * inch, 1.0 * inch, 1.3 * inch, 0.7 * inch, 0.65 * inch]
-
-    header_row = [Paragraph(c, styles["cell_header"]) for c in display_cols]
-    table_data = [header_row]
-
-    for row_i, (_, row) in enumerate(df.iterrows(), start=1):
-        cells = []
-        for col_i, col in enumerate(data_cols):
-            val = row.get(col, "")
-            val_str = str(val) if pd.notna(val) else "N/A"
-
-            if col == "score_numeric":
-                color = _score_color(val)
-                cell_style = ParagraphStyle(
-                    f"ScoreCell_{row_i}",
-                    parent=styles["cell"],
-                    textColor=color,
-                    fontName="Helvetica-Bold",
-                )
-                cells.append(Paragraph(val_str, cell_style))
-            elif col == "guardrail":
-                if val_str == "PASS":
-                    color = GUARDRAIL_PASS_COLOR
-                elif val_str == "FAIL":
-                    color = GUARDRAIL_FAIL_COLOR
-                else:
-                    color = colors.black
-                cell_style = ParagraphStyle(
-                    f"GRCell_{row_i}",
-                    parent=styles["cell"],
-                    textColor=color,
-                    fontName="Helvetica-Bold",
-                )
-                cells.append(Paragraph(val_str, cell_style))
-            else:
-                cells.append(Paragraph(val_str, styles["cell"]))
-        table_data.append(cells)
-
-    score_table = Table(table_data, colWidths=col_widths, repeatRows=1)
-
-    row_bg_commands = []
-    for i in range(1, len(table_data)):
-        bg = LIGHT_BLUE_BG if i % 2 == 0 else WHITE
-        row_bg_commands.append(("BACKGROUND", (0, i), (-1, i), bg))
-
-    score_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), DARK_BLUE),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        *row_bg_commands,
-    ]))
-    story.append(score_table)
-    story.append(Spacer(1, 12))
-
-    # ── Discontinuation Analysis ───────────────────────────────────────────────
-    disc_text = narrative.get("discontinuation_analysis", "")
-    if disc_text:
-        story.append(Paragraph("Discontinuation Rate Analysis", styles["h2"]))
-        story.append(Paragraph(disc_text, styles["body"]))
-        story.append(Spacer(1, 8))
-
-    # ── Risk & Strength Highlights ────────────────────────────────────────────
-    story.append(Paragraph("Risk &amp; Strength Analysis", styles["h2"]))
-
-    story.append(Paragraph(
-        '<font color="#CC0000"><b>At-Risk Drugs</b></font>',
-        styles["h3"],
-    ))
-    story.append(Paragraph(narrative.get("risk_highlights", "N/A"), styles["body"]))
-    story.append(Spacer(1, 6))
-
-    story.append(Paragraph(
-        '<font color="#008000"><b>Best Tolerability Profiles</b></font>',
-        styles["h3"],
-    ))
-    story.append(Paragraph(narrative.get("strength_highlights", "N/A"), styles["body"]))
-    story.append(Spacer(1, 12))
-
-    # ── Per-Drug Breakdown ────────────────────────────────────────────────────
-    per_drug = narrative.get("per_drug_narratives", {})
-    if per_drug:
-        story.append(Paragraph("Drug-Level Analysis", styles["h2"]))
-
-        for drug_name, drug_narrative in per_drug.items():
-            drug_stat = stats.get("per_drug_stats", {}).get(drug_name, {})
-
-            block = []
-            block.append(Paragraph(drug_name, styles["h3"]))
-
-            if drug_stat:
-                block.append(Paragraph(
-                    f"Score: {drug_stat.get('tolerability_score', 'N/A')}  |  "
-                    f"Discontinuation (Drug): {drug_stat.get('discontinuation_rate_drug', 'N/A')}  |  "
-                    f"vs SoC: {drug_stat.get('vs_soc', 'N/A')}  |  "
-                    f"Guardrail: {drug_stat.get('guardrail', 'N/A')}",
-                    styles["stat"],
-                ))
-
-            block.append(Paragraph(drug_narrative, styles["body"]))
-            story.append(KeepTogether(block))
-            story.append(Spacer(1, 6))
-
-    # ── Scoring Framework ─────────────────────────────────────────────────────
-    story.append(Paragraph("Tolerability Scoring Framework", styles["h2"]))
-
-    framework = [
-        ("5", "Excellent",   "Drug discontinuation ≤ placebo; minimal or no meaningful AE burden"),
-        ("4", "Good",        "Drug discontinuation > placebo but < 5%; low AE burden"),
-        ("3", "Moderate",    "Discontinuation 5–10%; manageable AE profile"),
-        ("2", "Poor",        "Discontinuation 10–20%; notable AE concerns"),
-        ("1", "Very Poor",   "Discontinuation ≥ 20%; significant safety / tolerability issues"),
-    ]
-
-    fw_header = [
-        Paragraph("Score", styles["cell_header"]),
-        Paragraph("Label", styles["cell_header"]),
-        Paragraph("Description", styles["cell_header"]),
-    ]
-    fw_data = [fw_header]
-    for sc, lbl, desc in framework:
-        fw_data.append([
-            Paragraph(sc, ParagraphStyle("FWScore", parent=styles["cell"], fontName="Helvetica-Bold")),
-            Paragraph(lbl, ParagraphStyle("FWLabel", parent=styles["cell"], fontName="Helvetica-Bold")),
-            Paragraph(desc, ParagraphStyle("FWDesc", parent=styles["cell"], alignment=TA_LEFT)),
-        ])
-
-    fw_table = Table(fw_data, colWidths=[0.5 * inch, 1.2 * inch, 4.6 * inch])
-    fw_row_bgs = []
-    for i in range(1, len(fw_data)):
-        bg = LIGHT_BLUE_BG if i % 2 == 0 else WHITE
-        fw_row_bgs.append(("BACKGROUND", (0, i), (-1, i), bg))
-
-    fw_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), DARK_BLUE),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (0, 0), (1, -1), "CENTER"),
-        ("ALIGN", (2, 1), (2, -1), "LEFT"),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        *fw_row_bgs,
-    ]))
-    story.append(fw_table)
-    story.append(Spacer(1, 10))
-
-    # ── Score Legend ──────────────────────────────────────────────────────────
     legend_text = "  |  ".join(f"{k} = {v}" for k, v in SCORE_LABEL.items())
     story.append(Paragraph(
         f"<b>Score Legend:</b>  {legend_text}",
         ParagraphStyle("Legend", parent=styles["body"], fontSize=8, textColor=LIGHT_GRAY),
     ))
 
-    # ── Adjustments Note ──────────────────────────────────────────────────────
-    story.append(Spacer(1, 6))
-    story.append(Paragraph(
-        "<b>Score Adjustments:</b>  SoC comparison: Better +1 | Worse −1 | Similar 0  "
-        "••  Patient burden: Mild/transient 0 | Persistent/moderate −1 | Severe/managed −2",
-        ParagraphStyle("AdjNote", parent=styles["body"], fontSize=8, textColor=LIGHT_GRAY),
+    # ── Footer ────────────────────────────────────────────────────────────
+    story.append(HRFlowable(
+        width="100%", thickness=0.5,
+        color=colors.HexColor("#CCCCCC"), spaceBefore=14,
     ))
-
-    # ── Footer ────────────────────────────────────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceBefore=14))
     story.append(Paragraph(
-        "This report was auto-generated from Patient Tolerability Scorer output "
-        "using Gemini for narrative analysis.",
+        "This report was auto-generated from Tolerability analysis output. "
+        "For internal use only.",
         styles["footer"],
     ))
 
     doc.build(story)
-    print(f"\n✅ Tolerability report saved → {output_path}")
+    print(f"  Report saved -> {output_path}")
 
 
 # ── GCS Upload ────────────────────────────────────────────────────────────────
 
-def upload_to_gcs(local_path: str, drug_names: list) -> list:
+def upload_to_gcs(local_path: str, molecule_name: str) -> str:
     try:
         from google.cloud import storage
     except ImportError:
@@ -658,65 +781,102 @@ def upload_to_gcs(local_path: str, drug_names: list) -> list:
     credentials = _get_credentials()
     client = storage.Client(project=BQ_PROJECT_ID, credentials=credentials)
     bucket = client.bucket(GCS_BUCKET)
-    gcs_uris = []
 
-    for drug_name in drug_names:
-        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", str(drug_name))
-        blob_name = f"{GCS_BASE_PATH}/{safe_name}/{GCS_FILE_NAME}"
-        gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
-        print(f"  Uploading to GCS: {gcs_uri}")
-        try:
-            blob = bucket.blob(blob_name)
-            blob.upload_from_filename(local_path, content_type="application/pdf")
-            gcs_uris.append(gcs_uri)
-        except Exception as e:
-            print(f"  [ERROR] GCS upload failed for '{drug_name}': {e}")
-            raise
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", str(molecule_name))
+    blob_name = f"{GCS_BASE_PATH}/{safe_name}/{GCS_FILE_NAME}"
+    gcs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
 
-    return gcs_uris
+    print(f"  Uploading to GCS: {gcs_uri}")
+    bucket.blob(blob_name).upload_from_filename(local_path, content_type="application/pdf")
+    return gcs_uri
 
 
-# ── Public entry point (for run_all.py) ───────────────────────────────────────
+# ── Public entry point ────────────────────────────────────────────────────────
 
-def generate_tolerability_report(molecule: str = None, output_path: str = None) -> str:
-    """Generate tolerability report. Returns the output file path."""
+def generate_tolerability_report(
+    molecules: list[str] | None = None,
+    outdir: str | None = None,
+) -> list[str]:
+    """
+    Generate one PDF report per molecule.
+
+    Args:
+        molecules: List of molecule names to report on. None = all in table.
+        outdir:    Directory to write PDFs into. Defaults to current directory.
+
+    Returns:
+        List of output PDF paths that were successfully created.
+    """
     if not API_KEY:
         print("[Tolerability Report] GEMINI_API_KEY not set — skipping report generation.")
-        return ""
+        return []
 
-    if output_path is None:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"tolerability_report_{ts}.pdf"
+    out_root = Path(outdir) if outdir else Path(".")
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    df = load_from_bigquery(molecule)
+    df = load_from_bigquery(molecules)
     if df.empty:
         print("[Tolerability Report] No data found — skipping.")
-        return ""
+        return []
 
-    build_report(df, output_path)
+    output_paths = []
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    drug_names = df["molecule_name"].dropna().unique().tolist()
-    if drug_names:
+    for _, row in df.iterrows():
+        stats = extract_molecule_stats(row)
+        molecule_name = stats["molecule_name"]
+
+        print(f"\nProcessing: {molecule_name}")
+
+        # Enrich data if BQ fields are insufficient
+        stats = enrich_molecule_data(stats)
+
+        print("  Generating narrative with Gemini...")
+        narrative = generate_tolerability_narrative(stats)
+
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", molecule_name)
+        output_path = str(out_root / f"tolerability_report_{safe_name}_{ts}.pdf")
+
+        build_single_molecule_report(stats, narrative, output_path)
+        output_paths.append(output_path)
+
         try:
-            print(f"\nUploading tolerability report to GCS for {len(drug_names)} drug(s)...")
-            gcs_uris = upload_to_gcs(output_path, drug_names)
-            for uri in gcs_uris:
-                print(f"  ✅ {uri}")
+            gcs_uri = upload_to_gcs(output_path, molecule_name)
+            print(f"  GCS: {gcs_uri}")
         except Exception as e:
-            print(f"  [WARN] GCS upload failed: {e}")
+            print(f"  [WARN] GCS upload failed for '{molecule_name}': {e}")
 
-    return output_path
+    print(f"\nDone. {len(output_paths)} report(s) generated.")
+    return output_paths
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Patient Tolerability PDF report from BigQuery")
-    parser.add_argument("--output", "-o", default=None, help="Output .pdf path")
-    parser.add_argument("--molecule", default=None, help="Filter to a specific molecule")
+    parser = argparse.ArgumentParser(
+        description="Generate one Tolerability PDF per molecule from BigQuery data."
+    )
+    parser.add_argument(
+        "--molecule", "-m",
+        default=None,
+        help=(
+            "Comma-separated molecule name(s) to report on. "
+            "E.g. --molecule Semaglutide  or  --molecule 'Semaglutide,Tirzepatide'. "
+            "Omit to process all molecules in the table."
+        ),
+    )
+    parser.add_argument(
+        "--outdir", "-o",
+        default=None,
+        help="Output directory for generated PDFs (default: current directory).",
+    )
     args = parser.parse_args()
 
-    generate_tolerability_report(molecule=args.molecule, output_path=args.output)
+    molecules = None
+    if args.molecule:
+        molecules = [m.strip() for m in args.molecule.split(",") if m.strip()]
+
+    generate_tolerability_report(molecules=molecules, outdir=args.outdir)
 
 
 if __name__ == "__main__":
