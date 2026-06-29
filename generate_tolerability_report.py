@@ -405,6 +405,8 @@ ADDITIONAL RESEARCH DATA:
 
 1. Start with a section: "Key Tolerability Findings for {stats['molecule_name']}"
    - Summarize the most important observations related to tolerability
+   - Include the overall tolerability score (e.g., "scored X out of 5") in simple terms
+     early in the findings — but do NOT explain how the score was derived
    - Highlight:
      - Discontinuation rates in comparison to placebo and standard of care
      - Key adverse events observed
@@ -441,8 +443,8 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
 {{
   "key_findings": {{
     "summary_bullets": [
-      "Key finding 1 about discontinuation rates vs placebo and standard of care",
-      "Key finding 2 about the most common adverse events and their frequency",
+      "Key finding 1 — include the tolerability score (e.g., X/5) and what it means in plain terms",
+      "Key finding 2 about discontinuation rates vs placebo and standard of care",
       "Key finding 3 about severity of side effects and patient experience",
       "Key finding 4 about notable differences vs comparator treatments",
       "Key finding 5 about any other important tolerability observations"
@@ -473,8 +475,8 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
     return {
         "key_findings": {
             "summary_bullets": [
+                f"{stats['molecule_name']} received a tolerability score of {stats['tolerability_score']} ({stats['score_label']}), reflecting its overall side-effect profile.",
                 f"Discontinuation rate (drug): {stats['discontinuation_rate_drug']}.",
-                f"Discontinuation rate (SoC): {stats['discontinuation_rate_soc']}. Difference: {stats['difference']}.",
                 f"Key adverse events reported: {stats['key_aes']}.",
                 f"AE severity: {stats['ae_severity']}. vs Placebo: {stats['vs_placebo']}.",
                 f"Guardrail status: {stats['guardrail']}.",
@@ -647,7 +649,7 @@ def build_single_molecule_report(stats: dict, narrative: dict, output_path: str)
     story.append(Paragraph(REPORT_TITLE, styles["title"]))
     story.append(Paragraph(stats["molecule_name"], styles["molecule_name_title"]))
     story.append(Paragraph(
-        f"Generated {datetime.now().strftime('%B %d, %Y')}",
+        f"Generated {datetime.now().strftime('%B %d, %Y')}  •  Tolerability Score: {stats['tolerability_score']} ({stats['score_label']})",
         styles["subtitle"],
     ))
     story.append(HRFlowable(width="100%", thickness=2, color=DARK_BLUE, spaceAfter=12))
