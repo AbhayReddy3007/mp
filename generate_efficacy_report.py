@@ -377,23 +377,20 @@ Return ONLY a valid JSON object:
 # ── LLM narrative (single molecule) ──────────────────────────────────────────
 
 def generate_efficacy_narrative(stats: dict) -> dict:
-    """Generate a structured, detailed clinical efficacy report narrative."""
+    """Generate a business-focused clinical efficacy report narrative for Medical Affairs."""
 
     # Build endpoint summary block
     ep_lines = []
     for ep_key, ep_label in ENDPOINT_LABELS.items():
         ep = stats["endpoints"].get(ep_key, {})
-        weight_pct = int(ENDPOINT_WEIGHTS[ep_key] * 100)
         if ep.get("score") is not None:
             ep_lines.append(
-                f"- {ep_label} ({weight_pct}% weight): Raw {ep['raw_value']}%, "
-                f"Adjusted {ep['adj_value']}%, Score {ep['score']}/5, "
-                f"Phase {ep['phase_used']}, Trial {ep['trial_id']}, "
-                f"Dosage {ep['dosage']}, Duration {ep['duration']}, "
-                f"{ep['reason']}"
+                f"- {ep_label}: Best result {ep['raw_value']}% "
+                f"(Phase {ep['phase_used']}, Trial {ep['trial_id']}, "
+                f"Dosage {ep['dosage']}, Duration {ep['duration']})"
             )
         else:
-            ep_lines.append(f"- {ep_label} ({weight_pct}% weight): No valid data available")
+            ep_lines.append(f"- {ep_label}: No valid data available")
 
     enrichment = stats.get("_enrichment", {})
     enrichment_block = ""
@@ -407,93 +404,98 @@ def generate_efficacy_narrative(stats: dict) -> dict:
         if enrich_parts:
             enrichment_block = "\n".join(enrich_parts)
 
-    prompt = f"""You are an expert pharmaceutical analyst specializing in clinical efficacy
-assessment. Your task is to generate a concise, structured report (maximum 2 pages)
-evaluating the Clinical Efficacy of a given product.
+    prompt = f"""You are a business-focused medical insights analyst.
 
-INPUT:
+Goal: Create a concise, 2-page Clinical Efficacy report for {stats['molecule_name']} that
+highlights key efficacy findings and insights derived from the provided data outputs. The
+report is intended for a Medical Affairs business audience.
+
+Context: The data comes from structured outputs containing clinical trial data and extracted
+efficacy-related data points (e.g., HbA1c reduction, weight change, liver enzyme changes,
+response rates, treatment duration, trial size, etc.). The audience is non-technical and not
+familiar with internal analytical frameworks, scoring methodologies, or internal jargon.
+
+Source: Use only the provided data outputs as the source of truth. Focus specifically on
+clinical efficacy-related fields and trial outcomes. Do not introduce external assumptions
+unless clearly derived from the data.
+
+=== PROVIDED DATA ===
 - Product Name: {stats['molecule_name']}
 - Company: {stats['company_name']}
-- Clinical Efficacy Score: {stats['efficacy_score']} / 5 ({stats['score_label']})
+- Efficacy Score: {stats['efficacy_score']} / 5 ({stats['score_label']})
 - Data Coverage: {stats['data_coverage']}
 - Total Trials Analyzed: {stats['total_trials']}
 - Phase Distribution: {json.dumps(stats['phase_distribution'])}
 - Endpoints Scored: {stats['scored_endpoints']}/4
 
-ENDPOINT PERFORMANCE:
+ENDPOINT RESULTS:
 {chr(10).join(ep_lines)}
 
-STORED RATIONALE FROM ANALYSIS:
+STORED ANALYSIS RATIONALE:
 {stats.get('rationale', 'Not available')}
 
 ADDITIONAL RESEARCH DATA:
 {enrichment_block if enrichment_block else 'Not available'}
 
-OUTPUT REQUIREMENTS — Generate a structured report with these exact sections:
+=== INSTRUCTIONS ===
 
-EXECUTIVE SUMMARY
-- Provide a crisp overview (6-8 bullet points) covering:
-  - The clinical efficacy score and what it means
-  - Performance across the four endpoints (Weight Loss, HbA1c, MASH, ALT)
-  - Data quality: number of trials, phase distribution, coverage
-  - Key differentiators or limitations
-- Keep this section concise and decision-oriented
+1. Start with: "Key Clinical Efficacy Findings for {stats['molecule_name']}"
+   - Summarize the most important efficacy outcomes observed across trials
+   - Highlight key metrics such as:
+     - Improvements in disease-specific endpoints (HbA1c reduction, weight loss, liver markers)
+     - Duration over which efficacy is observed
+     - Consistency of results across studies or populations
+   - Focus on what the data shows, not how it was calculated
 
-ENDPOINT PERFORMANCE OVERVIEW
-- For each of the 4 endpoints, provide a focused subsection:
-  - Weight Loss: best result achieved, dosage, duration, trial phase, clinical significance
-  - HbA1c Reduction: best result, dosage, duration, trial, clinical benchmarks
-  - MASH Resolution: result if available, or explain why data is limited
-  - ALT Reduction: result if available, or explain limited data
-- Reference specific trial IDs, dosages, and durations
-- Compare against clinical significance thresholds (e.g., >15% weight loss = exceptional)
+2. Follow with: "Insights and Implications"
+   - Translate clinical findings into business-relevant insights
+   - Highlight:
+     - Strength of efficacy across different endpoints
+     - Any standout outcomes or differentiating factors
+     - Gaps, inconsistencies, or limitations in efficacy data
+     - Potential implications for positioning, adoption, or patient segments
+   - Keep insights simple, clear, and actionable
 
-SCORING METHODOLOGY & RATIONALE
-- Explain the scoring methodology (threshold table, phase penalties, endpoint weights)
-- Show how the weighted score was calculated
-- Justify why this score was assigned
-- Note any penalties applied (Phase 2 data = x0.85, Phase 1 = x0.65)
+3. Include: "Efficacy Profile Summary"
+   - Provide a high-level synthesis of the molecule's overall clinical effectiveness
+   - Comment on breadth of efficacy across multiple endpoints or indications
+   - Mention the overall efficacy score briefly and in simple terms without explaining
+     the scoring methodology
 
-STRATEGIC IMPLICATIONS
-- Explain what the efficacy score means for competitive positioning
-- Discuss strategic value for portfolio selection
-- Note implications for regulatory pathway and commercial potential
-- Compare against class benchmarks where relevant
+Language and Style:
+- Do NOT use internal jargon, technical modeling terms, or scoring framework names
+- Avoid statistical or methodological explanations unless essential
+- Use clear, simple, and business-friendly language
+- Translate clinical metrics into plain-language meaning wherever possible
 
-FORMATTING & HYGIENE INSTRUCTIONS:
-- Use bullet points wherever possible
-- Keep paragraphs short (2-4 lines max)
-- Avoid repetition
-- Use precise, evidence-based reasoning
-- Professional, analytical tone suitable for leadership review
+Tone: Professional, objective, and insight-driven. Focus on clarity, relevance, and
+business impact rather than technical depth.
 
 Respond ONLY with a valid JSON object (no markdown fences, no extra text):
 {{
-  "executive_summary": [
-    "Bullet 1 about the efficacy score and overall performance",
-    "Bullet 2 about weight loss performance",
-    "Bullet 3 about HbA1c performance",
-    "Bullet 4 about MASH/ALT or data coverage",
-    "Bullet 5 about data quality and trial distribution",
-    "Bullet 6 about strategic implications"
-  ],
-  "endpoint_overview": {{
-    "weight_loss": "3-5 sentences on weight loss efficacy with specific numbers, dosage, duration, trial ID, and clinical significance benchmarks",
-    "hba1c": "3-5 sentences on HbA1c reduction with specific numbers, dosage, duration, trial ID, and clinical benchmarks",
-    "mash": "2-3 sentences on MASH resolution data or explanation of why it is limited/not available",
-    "alt": "2-3 sentences on ALT reduction data or explanation of why it is limited/not available"
+  "key_findings": {{
+    "summary_bullets": [
+      "Key finding 1 about the most significant efficacy outcomes",
+      "Key finding 2 about weight loss or metabolic improvements",
+      "Key finding 3 about HbA1c reduction and glycemic control",
+      "Key finding 4 about liver-related endpoints if available",
+      "Key finding 5 about consistency across studies or notable trial results"
+    ],
+    "weight_loss_detail": "3-4 sentences in plain language about weight loss results — what percentage of weight loss was achieved, over what timeframe, at what dose, and what this means clinically for patients",
+    "hba1c_detail": "3-4 sentences in plain language about HbA1c improvements — how much reduction was achieved, over what timeframe, and what this means for diabetes management",
+    "liver_endpoints_detail": "2-3 sentences about MASH resolution and ALT reduction results if available, or a brief note on why data is limited for these endpoints"
   }},
-  "scoring_rationale": {{
-    "methodology": "2-3 sentences explaining the scoring methodology (thresholds, phase penalties, weights)",
-    "calculation": "2-3 sentences showing how the weighted score was computed from endpoint scores",
-    "justification": "2-3 sentences on why this score accurately reflects the drug's clinical efficacy"
+  "insights_implications": {{
+    "efficacy_strength": "2-3 sentences on the overall strength of efficacy and any standout results that differentiate this molecule",
+    "gaps_limitations": "2-3 sentences on gaps or inconsistencies in the efficacy data, including missing endpoints or limited data",
+    "positioning_impact": "2-3 sentences on what the efficacy profile implies for competitive positioning, adoption by physicians, and patient segments",
+    "differentiation": "2-3 sentences on key differentiating factors compared to other treatments in the class"
   }},
-  "strategic_implications": {{
-    "competitive_positioning": "2-3 sentences on how this efficacy profile positions the drug competitively",
-    "regulatory_commercial": "2-3 sentences on regulatory pathway and commercial potential implications",
-    "portfolio_value": "2-3 sentences on strategic value for portfolio decisions"
-  }},
-  "score_methodology_note": "2-3 plain-language sentences explaining how the clinical efficacy score is determined at a high level"
+  "profile_summary": {{
+    "overall_assessment": "3-4 sentences providing a high-level synthesis of the molecule's clinical effectiveness, written for a business audience",
+    "endpoint_breadth": "1-2 sentences commenting on the breadth of efficacy across multiple endpoints",
+    "score_context": "1-2 sentences briefly mentioning the efficacy score in simple terms (e.g., 'The molecule demonstrates strong/moderate/limited clinical efficacy') WITHOUT explaining how the score was calculated"
+  }}
 }}"""
 
     text = call_gemini(prompt)
@@ -503,32 +505,26 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
 
     # Fallback
     return {
-        "executive_summary": [
-            f"{stats['molecule_name']} achieves a clinical efficacy score of {stats['efficacy_score']}/5 ({stats['score_label']}).",
-            f"Data coverage: {stats['data_coverage']} across {stats['total_trials']} trials.",
-            f"Endpoints scored: {stats['scored_endpoints']}/4.",
-        ],
-        "endpoint_overview": {
-            "weight_loss": stats.get("rationale", "See detailed analysis."),
-            "hba1c": "See detailed analysis.",
-            "mash": "See detailed analysis.",
-            "alt": "See detailed analysis.",
+        "key_findings": {
+            "summary_bullets": [
+                f"{stats['molecule_name']} shows efficacy across {stats['scored_endpoints']}/4 endpoints evaluated.",
+                f"Data coverage: {stats['data_coverage']} across {stats['total_trials']} trials.",
+            ],
+            "weight_loss_detail": stats.get("rationale", "See detailed analysis."),
+            "hba1c_detail": "See detailed analysis.",
+            "liver_endpoints_detail": "See detailed analysis.",
         },
-        "scoring_rationale": {
-            "methodology": "Scored using phase-anchored threshold table with endpoint weighting.",
-            "calculation": f"Weighted score: {stats['efficacy_score']}/5.",
-            "justification": "Based on best available clinical trial data.",
+        "insights_implications": {
+            "efficacy_strength": "Refer to detailed analysis.",
+            "gaps_limitations": "Refer to detailed analysis.",
+            "positioning_impact": "Refer to detailed analysis.",
+            "differentiation": "Refer to detailed analysis.",
         },
-        "strategic_implications": {
-            "competitive_positioning": "Refer to detailed analysis.",
-            "regulatory_commercial": "Refer to detailed analysis.",
-            "portfolio_value": "Refer to detailed analysis.",
+        "profile_summary": {
+            "overall_assessment": f"{stats['molecule_name']} received an efficacy score of {stats['efficacy_score']}/5 ({stats['score_label']}).",
+            "endpoint_breadth": f"{stats['scored_endpoints']} out of 4 endpoints had evaluable data.",
+            "score_context": f"The molecule demonstrates {stats['score_label'].lower()} clinical efficacy.",
         },
-        "score_methodology_note": (
-            "The clinical efficacy score is a weighted average of four endpoints: "
-            "Weight Loss (40%), HbA1c Reduction (40%), MASH Resolution (10%), and ALT Reduction (10%). "
-            "Phase penalties apply for Phase 2 (x0.85) and Phase 1 (x0.65) data."
-        ),
     }
 
 
@@ -728,93 +724,109 @@ def build_single_molecule_report(stats: dict, narrative: dict, output_path: str)
     # ── Title block ───────────────────────────────────────────────────────
     story.append(Paragraph(REPORT_TITLE, styles["title"]))
     story.append(Paragraph(stats["molecule_name"], styles["molecule_name_title"]))
-    score_display = f"{stats['efficacy_score']}/5" if stats['efficacy_score'] is not None else "N/A"
     story.append(Paragraph(
-        f"Generated {datetime.now().strftime('%B %d, %Y')}  •  Score: {score_display} ({stats['score_label']})  •  {stats['total_trials']} trials",
+        f"Generated {datetime.now().strftime('%B %d, %Y')}",
         styles["subtitle"],
     ))
     story.append(HRFlowable(width="100%", thickness=2, color=DARK_BLUE, spaceAfter=12))
 
-    # ── Executive Summary ─────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # Key Clinical Efficacy Findings
+    # ══════════════════════════════════════════════════════════════════════
     story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
-    story.append(Paragraph("Executive Summary", styles["h2"]))
-    exec_summary = narrative.get("executive_summary", [])
-    if isinstance(exec_summary, list):
-        _render_bullets(exec_summary, styles, story)
-    elif isinstance(exec_summary, str):
-        story.append(Paragraph(exec_summary, styles["body"]))
+    story.append(Paragraph(
+        f"Key Clinical Efficacy Findings for {stats['molecule_name']}", styles["h2"]
+    ))
+
+    key_findings = narrative.get("key_findings", {})
+    if isinstance(key_findings, dict):
+        # Bullet summary
+        bullets = key_findings.get("summary_bullets", [])
+        if isinstance(bullets, list):
+            _render_bullets(bullets, styles, story)
+        story.append(Spacer(1, 6))
+
+        # Endpoint summary table (compact visual)
+        story.append(_endpoint_summary_table(stats, styles))
+        story.append(Spacer(1, 8))
+
+        wl_detail = key_findings.get("weight_loss_detail", "")
+        if wl_detail:
+            story.append(Paragraph("<b>Weight Loss:</b>", styles["section_label"]))
+            story.append(Paragraph(wl_detail, styles["body"]))
+            story.append(Spacer(1, 4))
+
+        hba1c_detail = key_findings.get("hba1c_detail", "")
+        if hba1c_detail:
+            story.append(Paragraph("<b>HbA1c Reduction:</b>", styles["section_label"]))
+            story.append(Paragraph(hba1c_detail, styles["body"]))
+            story.append(Spacer(1, 4))
+
+        liver_detail = key_findings.get("liver_endpoints_detail", "")
+        if liver_detail:
+            story.append(Paragraph("<b>Liver Endpoints (MASH / ALT):</b>", styles["section_label"]))
+            story.append(Paragraph(liver_detail, styles["body"]))
+    elif isinstance(key_findings, str):
+        story.append(Paragraph(key_findings, styles["body"]))
     story.append(Spacer(1, 6))
 
-    # ── Endpoint Performance Overview ─────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # Insights and Implications
+    # ══════════════════════════════════════════════════════════════════════
     story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
-    story.append(Paragraph("Endpoint Performance Overview", styles["h2"]))
+    story.append(Paragraph("Insights and Implications", styles["h2"]))
 
-    # Endpoint summary table
-    story.append(_endpoint_summary_table(stats, styles))
+    insights = narrative.get("insights_implications", {})
+    if isinstance(insights, dict):
+        efficacy_str = insights.get("efficacy_strength", "")
+        if efficacy_str:
+            story.append(Paragraph(f"<b>Efficacy Strength:</b> {efficacy_str}", styles["body"]))
+            story.append(Spacer(1, 4))
+
+        gaps = insights.get("gaps_limitations", "")
+        if gaps:
+            story.append(Paragraph(f"<b>Gaps &amp; Limitations:</b> {gaps}", styles["body"]))
+            story.append(Spacer(1, 4))
+
+        positioning = insights.get("positioning_impact", "")
+        if positioning:
+            story.append(Paragraph(f"<b>Positioning &amp; Adoption:</b> {positioning}", styles["body"]))
+            story.append(Spacer(1, 4))
+
+        differentiation = insights.get("differentiation", "")
+        if differentiation:
+            story.append(Paragraph(f"<b>Differentiation:</b> {differentiation}", styles["body"]))
+    elif isinstance(insights, str):
+        story.append(Paragraph(insights, styles["body"]))
+    story.append(Spacer(1, 6))
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Efficacy Profile Summary
+    # ══════════════════════════════════════════════════════════════════════
+    story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
+    story.append(Paragraph("Efficacy Profile Summary", styles["h2"]))
+
+    profile_summary = narrative.get("profile_summary", {})
+    if isinstance(profile_summary, dict):
+        overall = profile_summary.get("overall_assessment", "")
+        if overall:
+            story.append(Paragraph(overall, styles["body"]))
+            story.append(Spacer(1, 4))
+
+        breadth = profile_summary.get("endpoint_breadth", "")
+        if breadth:
+            story.append(Paragraph(breadth, styles["body"]))
+            story.append(Spacer(1, 4))
+
+        score_ctx = profile_summary.get("score_context", "")
+        if score_ctx:
+            story.append(Paragraph(score_ctx, styles["body"]))
+    elif isinstance(profile_summary, str):
+        story.append(Paragraph(profile_summary, styles["body"]))
     story.append(Spacer(1, 8))
-
-    ep_overview = narrative.get("endpoint_overview", {})
-    if isinstance(ep_overview, dict):
-        for ep_key, ep_label in ENDPOINT_LABELS.items():
-            content = ep_overview.get(ep_key, "")
-            if content:
-                story.append(Paragraph(f"<b>{ep_label}:</b>", styles["section_label"]))
-                story.append(Paragraph(content, styles["body"]))
-                story.append(Spacer(1, 3))
-    elif isinstance(ep_overview, str):
-        story.append(Paragraph(ep_overview, styles["body"]))
-    story.append(Spacer(1, 6))
-
-    # ── Scoring Methodology & Rationale ───────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
-    story.append(Paragraph("Scoring Methodology &amp; Rationale", styles["h2"]))
-
-    scoring = narrative.get("scoring_rationale", {})
-    if isinstance(scoring, dict):
-        methodology = scoring.get("methodology", "")
-        if methodology:
-            story.append(Paragraph(f"<b>Methodology:</b> {methodology}", styles["body"]))
-            story.append(Spacer(1, 4))
-        calculation = scoring.get("calculation", "")
-        if calculation:
-            story.append(Paragraph(f"<b>Calculation:</b> {calculation}", styles["body"]))
-            story.append(Spacer(1, 4))
-        justification = scoring.get("justification", "")
-        if justification:
-            story.append(Paragraph(f"<b>Justification:</b> {justification}", styles["body"]))
-    elif isinstance(scoring, str):
-        story.append(Paragraph(scoring, styles["body"]))
-    story.append(Spacer(1, 6))
-
-    # ── Strategic Implications ────────────────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
-    story.append(Paragraph("Strategic Implications", styles["h2"]))
-
-    strategic = narrative.get("strategic_implications", {})
-    if isinstance(strategic, dict):
-        comp_pos = strategic.get("competitive_positioning", "")
-        if comp_pos:
-            story.append(Paragraph(f"<b>Competitive Positioning:</b> {comp_pos}", styles["body"]))
-            story.append(Spacer(1, 4))
-        reg_comm = strategic.get("regulatory_commercial", "")
-        if reg_comm:
-            story.append(Paragraph(f"<b>Regulatory &amp; Commercial:</b> {reg_comm}", styles["body"]))
-            story.append(Spacer(1, 4))
-        portfolio = strategic.get("portfolio_value", "")
-        if portfolio:
-            story.append(Paragraph(f"<b>Portfolio Value:</b> {portfolio}", styles["body"]))
-    elif isinstance(strategic, str):
-        story.append(Paragraph(strategic, styles["body"]))
-    story.append(Spacer(1, 8))
-
-    # ── Methodology note ──────────────────────────────────────────────────
-    methodology_note = narrative.get("score_methodology_note", "")
-    if methodology_note:
-        story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
-        story.append(Paragraph("About the Clinical Efficacy Score", styles["h2"]))
-        story.append(Paragraph(methodology_note, styles["methodology_note"]))
 
     # ── Scoring reference table ───────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=0.5, color=DIVIDER_COLOR, spaceAfter=6))
     story.append(Paragraph("Clinical Efficacy Scoring Reference", styles["h2"]))
     story.append(_scoring_framework_table(styles))
     story.append(Spacer(1, 8))
@@ -828,8 +840,8 @@ def build_single_molecule_report(stats: dict, narrative: dict, output_path: str)
     # ── Footer ────────────────────────────────────────────────────────────
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceBefore=14))
     story.append(Paragraph(
-        "This report was auto-generated from Clinical Efficacy Scorer output "
-        "using Gemini for narrative analysis. For internal use only.",
+        "This report was auto-generated from Clinical Efficacy analysis output. "
+        "For internal use only.",
         styles["footer"],
     ))
 
