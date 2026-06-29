@@ -443,7 +443,7 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
 {{
   "key_findings": {{
     "summary_bullets": [
-      "Key finding 1 — include the tolerability score (e.g., X/5) and what it means in plain terms",
+      "Key finding 1 — MUST state the tolerability score as X out of 5 (use the exact score from the data) and what it indicates for patient tolerability in plain terms",
       "Key finding 2 about discontinuation rates vs placebo and standard of care",
       "Key finding 3 about severity of side effects and patient experience",
       "Key finding 4 about notable differences vs comparator treatments",
@@ -462,7 +462,7 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
   "profile_summary": {{
     "overall_assessment": "3-4 sentences providing a high-level summary of how well tolerated this molecule is overall, written for a business audience",
     "cross_study_consistency": "1-2 sentences commenting on whether tolerability findings are consistent across available studies",
-    "score_context": "1-2 sentences briefly mentioning the tolerability score in simple terms (e.g., 'The molecule received a favorable/moderate/concerning tolerability rating') WITHOUT explaining how the score was calculated"
+    "score_context": "1-2 sentences stating the tolerability score explicitly (e.g., 'The molecule scored 3 out of 5 on tolerability, indicating a moderate tolerability profile'). ALWAYS include the numeric score (X out of 5). Do NOT explain how the score was derived."
   }}
 }}"""
 
@@ -494,7 +494,7 @@ Respond ONLY with a valid JSON object (no markdown fences, no extra text):
         "profile_summary": {
             "overall_assessment": f"{stats['molecule_name']} received a tolerability score of {stats['tolerability_score']} ({stats['score_label']}).",
             "cross_study_consistency": "Data consistency is based on available clinical trial evidence.",
-            "score_context": f"The molecule received a {stats['score_label'].lower()} tolerability rating.",
+            "score_context": f"The molecule scored {stats['tolerability_score']} on tolerability, indicating a {stats['score_label'].lower()} tolerability profile.",
         },
     }
 
