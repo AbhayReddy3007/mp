@@ -208,6 +208,30 @@ def _wrap_text(text, width=88, indent="    "):
     return "\n".join(f"{indent}{line}" for line in lines) if lines else f"{indent}{text}"
 
 
+def get_innovator(trials, molecule=None):
+    """
+    Determine the innovator (originating company) for a molecule.
+
+    Uses the company_name field recorded against each individual trial
+    (the most direct, per-trial source of truth) and takes the mode
+    across all trials, rather than relying on a single upstream
+    sponsor lookup done once in Step 0. Falls back to the molecule's
+    'sponsor' field (from FDA/ClinicalTrials.gov normalization) only
+    if no trial-level company_name data is available.
+    """
+    names = [t.get("company_name", "") for t in (trials or [])]
+    names = [n for n in names if n and n != "Unknown"]
+    if names:
+        try:
+            return _stat_mode(names)
+        except Exception:
+            from collections import Counter
+            return Counter(names).most_common(1)[0][0]
+    if molecule:
+        return molecule.get("sponsor", "Unknown")
+    return "Unknown"
+
+
 # ===================================================================
 # STEP 0 -- Molecule Normalization (fully dynamic from web sources)
 # ===================================================================
@@ -1718,7 +1742,7 @@ def identify_evidence_gaps(trials, publications, assessment, consolidation) -> l
 
 # -- Table 1: molecule_scoring (1 row per molecule) --
 SCORING_COLUMNS = [
-    "molecule_name", "brand_names", "sponsor", "dev_codes",
+    "molecule_name", "brand_names", "innovator", "dev_codes",
     "total_clinical_studies", "studies_with_results", "peer_reviewed_publications",
     "highest_trial_phase", "total_patients_enrolled", "largest_trial_size",
     "rct_count", "has_regulatory_approval",
@@ -1738,7 +1762,7 @@ SCORING_COLUMNS = [
 TRIAL_COLUMNS = [
     "molecule_name", "trial_id", "title", "phase", "study_design",
     "trial_size", "trial_location", "comparator_arms", "duration",
-    "status", "sponsor", "results_available",
+    "status", "innovator", "results_available",
     "hba1c_change_pct", "weight_change_pct",
     "source", "report_generated_at",
 ]
@@ -1757,7 +1781,7 @@ def build_scoring_row(molecule, trials, publications, assessment,
     return {
         "molecule_name":           molecule["generic_name"],
         "brand_names":             "; ".join(molecule.get("brand_names", [])),
-        "sponsor":                 molecule.get("sponsor", ""),
+        "innovator":               get_innovator(trials, molecule),
         "dev_codes":               "; ".join(molecule.get("dev_codes", [])),
         "total_clinical_studies":  assessment["total_trials"],
         "studies_with_results":    assessment["trials_with_results"],
@@ -1806,7 +1830,7 @@ def build_trial_rows(molecule, trials, ts):
             "comparator_arms":   comp_str,
             "duration":          t.get("duration", ""),
             "status":            t.get("status", ""),
-            "sponsor":           t.get("company_name", ""),
+            "innovator":         t.get("company_name", ""),
             "results_available": t.get("results_available", False),
             "hba1c_change_pct":  t.get("hba1c_change_pct", ""),
             "weight_change_pct": t.get("weight_change_pct", ""),
@@ -1911,7 +1935,7 @@ def generate_report(molecule, trials, publications, sponsor_info,
     L.append(f"  Generic Name  : {molecule['generic_name']}")
     L.append(f"  Brand Name(s) : {', '.join(molecule.get('brand_names', [])) or 'N/A'}")
     L.append(f"  Dev Code(s)   : {', '.join(molecule.get('dev_codes', [])) or 'N/A'}")
-    L.append(f"  Sponsor       : {molecule.get('sponsor', 'Unknown')}")
+    L.append(f"  Innovator     : {get_innovator(trials, molecule)}")
     L.append(f"  Indications   : {', '.join(molecule.get('indications', [])[:8]) or 'N/A'}")
 
     # SCORING (Step 6)
@@ -2010,8 +2034,8 @@ def generate_report(molecule, trials, publications, sponsor_info,
     L.append(f"  Aggregate statistics are reported in the EVIDENCE OVERVIEW section above.")
 
     # Sponsor
-    sec("INNOVATOR / SPONSOR")
-    L.append(f"  Sponsor: {sponsor_info.get('sponsor', 'N/A')}")
+    sec("INNOVATOR")
+    L.append(f"  Innovator: {get_innovator(trials, molecule)}")
     fda = sponsor_info.get("fda_product_entries", [])
     if fda:
         sub("FDA Product Entries")
@@ -2345,7 +2369,7 @@ def run_molecule(args_molecule, args_max_trials, args_write_bq) -> dict:
     return {
         "molecule":               molecule["generic_name"],
         "brand_names":            ", ".join(molecule.get("brand_names", [])),
-        "sponsor":                molecule.get("sponsor", ""),
+        "Innovator":              get_innovator(trials, molecule),
         "P":                      P,
         "D":                      D,
         "G":                      G,
@@ -2410,7 +2434,7 @@ def write_pdgec_excel(rows: list, path: Path):
 
     # Section header row
     headers = [
-        "Molecule", "Brand Names", "Sponsor",
+        "Molecule", "Brand Names", "Innovator",
         "P (Phase)", "D (Design)", "G (Geo)", "E (Evidence)", "C (Consistency)", "Final Score",
         "Evidence Level", "Total Trials", "RCT Count", "Publications", "FDA Approved"
     ]
@@ -2435,7 +2459,7 @@ def write_pdgec_excel(rows: list, path: Path):
         values = [
             row.get("molecule", ""),
             row.get("brand_names", ""),
-            row.get("sponsor", ""),
+            row.get("Innovator", ""),
             row.get("P", ""),
             row.get("D", ""),
             row.get("G", ""),
