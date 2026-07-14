@@ -16,6 +16,9 @@ Usage:
     # Run all dimensions for a single molecule
     python market_potential/run_all.py --molecule Semaglutide
 
+    # Run all dimensions for multiple specific molecules
+    python market_potential/run_all.py --molecules "Semaglutide,Tirzepatide,Liraglutide"
+
     # Run specific dimensions only (comma-separated: 1, 3, 6, P)
     python market_potential/run_all.py --molecule Semaglutide --dimensions 1,3,6
 
@@ -99,6 +102,27 @@ def get_glp1_molecules() -> list[str]:
     results = client.query(GLP1_PRODUCT_LIST_QUERY).result()
     molecules = [row.cleaned_generic_name for row in results if row.cleaned_generic_name]
     print(f"Found {len(molecules)} GLP-1 molecules")
+    return molecules
+
+
+def _parse_molecules_list(raw: str) -> list[str]:
+    """Parse a comma-separated molecules string into a clean, de-duplicated list.
+
+    - Trims whitespace around each entry
+    - Drops empty entries (e.g. trailing commas)
+    - Preserves original order, removes exact duplicates
+    """
+    seen = set()
+    molecules = []
+    for m in raw.split(","):
+        name = m.strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        molecules.append(name)
     return molecules
 
 
@@ -270,12 +294,14 @@ Dimension codes:
 
 Examples:
   python run_all.py --molecule Semaglutide
+  python run_all.py --molecules "Semaglutide,Tirzepatide,Liraglutide" --dimensions 1,6
   python run_all.py --molecule Semaglutide --dimensions 1,3
   python run_all.py --concurrency 3
   python run_all.py --task-index 0 --task-count 5
 """,
     )
     parser.add_argument("--molecule", help="Process a specific molecule only")
+    parser.add_argument("--molecules", help="Comma-separated list of specific molecules to process (e.g. \"Semaglutide,Tirzepatide,Liraglutide\")")
     parser.add_argument("--dimensions", default="1,3,6,P",
                         help="Comma-separated dimension codes to run (default: 1,3,6,P)")
     parser.add_argument("--drug-class", default="GLP-1",
@@ -299,6 +325,11 @@ Examples:
         print(f"ERROR: Invalid dimension codes: {invalid}. Valid: {VALID_DIMENSIONS}")
         sys.exit(1)
 
+    # --molecule and --molecules are mutually exclusive
+    if args.molecule and args.molecules:
+        print("ERROR: Use either --molecule or --molecules, not both.")
+        sys.exit(1)
+
     # Cloud Run env fallbacks
     task_index = args.task_index if args.task_index is not None else int(os.getenv("CLOUD_RUN_TASK_INDEX", -1))
     task_count = args.task_count if args.task_count is not None else int(os.getenv("CLOUD_RUN_TASK_COUNT", -1))
@@ -315,7 +346,13 @@ Examples:
         sys.exit(1)
 
     # Determine molecules
-    if args.molecule:
+    if args.molecules:
+        molecules = _parse_molecules_list(args.molecules)
+        if not molecules:
+            print("ERROR: --molecules was provided but no valid molecule names were parsed.")
+            sys.exit(1)
+        print(f"Mode: Custom molecule list ({len(molecules)} molecules)")
+    elif args.molecule:
         molecules = [args.molecule]
         print(f"Mode: Single molecule ({args.molecule})")
     elif task_index >= 0 and task_count > 0:
